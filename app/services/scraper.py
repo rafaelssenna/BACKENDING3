@@ -12,6 +12,19 @@ from playwright.async_api import (
     TimeoutError as PWTimeoutError,
     Error as PWError,
 )
+
+# Import TargetClosedError from internal Playwright module.  This exception
+# surfaces when a page, context or browser has been closed (either by our
+# code or unexpectedly).  Because the import path may change across
+# Playwright versions, we fall back to PWError if the import fails.  Having
+# this alias allows us to explicitly catch these errors without masking
+# unrelated exceptions.
+try:
+    from playwright._impl._errors import TargetClosedError  # type: ignore
+except Exception:
+    # Fallback: reuse PWError so our except blocks still match.
+    class TargetClosedError(PWError):  # type: ignore
+        pass
 from ..config import settings
 from ..utils.phone import extract_phones_from_text, normalize_br
 
@@ -253,6 +266,39 @@ def _cooldown_secs(hit: int) -> int:
 _pw = None
 _browser = None
 
+# Track how many scrape operations are currently running.  The "Target page, context or
+# browser has been closed" errors often occur when a shutdown coincides with an
+# in-flight Playwright action.  By maintaining a counter of active searches we can
+# delay browser shutdown until all searches finish.  Use an asyncio.Lock to guard
+# increments/decrements.
+_active_scrapes: int = 0
+_active_lock: asyncio.Lock = asyncio.Lock()
+
+# Helper to check if a page or context is already closed.  Playwright objects
+# expose an is_closed() method but may raise if the underlying target is gone.
+def _is_closed(obj) -> bool:
+    try:
+        return getattr(obj, "is_closed", lambda: True)()
+    except Exception:
+        return True
+
+# Safely close a page, ignoring any errors due to the target already being closed.
+async def _safe_close_page(page) -> None:
+    try:
+        if page and not _is_closed(page):
+            await page.close()
+    except (PWError, TargetClosedError, Exception):
+        pass
+
+# Safely open a new page from a context.  Returns None if the context is closed.
+async def _safe_new_page(context):
+    try:
+        if not context or _is_closed(context):
+            return None
+        return await context.new_page()
+    except (PWError, TargetClosedError, Exception):
+        return None
+
 async def _ensure_browser():
     global _pw, _browser
     if _pw is None:
@@ -287,43 +333,64 @@ async def _new_context():
 
 # ---------- navegação blindada ----------
 async def _safe_goto(page, url: str, **kw):
+    # Navigate to a URL shielding from cancellation.  If the page is already closed
+    # we propagate TargetClosedError to allow the caller to recover.  On
+    # cancellation we close the page gracefully.
+    if not page or _is_closed(page):
+        # Signal to caller that the page cannot be used
+        raise TargetClosedError("page is closed")  # type: ignore[arg-type]
     try:
         return await asyncio.shield(page.goto(url, **kw))
     except CancelledError:
-        try:
-            await page.close()
-        except Exception:
-            pass
+        # If our coroutine is cancelled (e.g. client disconnect), close the page
+        # but propagate the CancelledError up the stack.
+        await _safe_close_page(page)
+        raise
+    except (PWError, TargetClosedError):
+        # Bubble up Playwright errors; the caller can decide whether to retry.
         raise
 
 # ---------- abrir ficha ----------
 async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> List[str]:
     out: List[str] = []
-    if not href: return out
-    if href.startswith("/"): href = "https://www.google.com" + href
+    if not href or not context or _is_closed(context):
+        return out
+    # Google sometimes returns relative paths.  Prepend domain if needed.
+    if href.startswith("/"):
+        href = "https://www.google.com" + href
 
-    page2 = await context.new_page()
+    # Create a new page safely.  It may return None if context is closed.
+    page2 = await _safe_new_page(context)
+    if not page2:
+        return out
     try:
+        # Navigate to the listing.  If this fails due to TargetClosedError we
+        # simply return an empty list.
         await _safe_goto(page2, href, wait_until="domcontentloaded", timeout=30000)
+        # Expand call/phone buttons if visible
         for sel in ["button:has-text('Telefone')", "button:has-text('Ligar')", "a[aria-label^='Ligar']", "[aria-label*='Telefone']"]:
             try:
+                if _is_closed(page2):
+                    break
                 loc = page2.locator(sel)
                 if await loc.count() > 0 and await loc.first.is_visible():
                     await loc.first.click()
                     await page2.wait_for_timeout(350)
-            except Exception:
+            except (PWError, TargetClosedError, Exception):
                 pass
-        await page2.wait_for_timeout(1000)
-        phones = await _extract_phones_from_page(page2)
-        for ph in phones:
-            if ph not in seen:
-                seen.add(ph)
-                out.append(ph)
-    except (PWError, CancelledError, Exception):
+        if not _is_closed(page2):
+            await page2.wait_for_timeout(1000)
+            phones = await _extract_phones_from_page(page2)
+            for ph in phones:
+                if ph not in seen:
+                    seen.add(ph)
+                    out.append(ph)
+    except (PWError, TargetClosedError, CancelledError, Exception):
+        # Swallow exceptions; extraction failures should not bubble
         pass
     finally:
-        try: await page2.close()
-        except (PWError, CancelledError, Exception): pass
+        # Always close the page safely
+        await _safe_close_page(page2)
     return out
 
 # ---------- busca principal ----------
@@ -340,6 +407,12 @@ async def search_numbers(
     captcha_hits_global = 0
 
     context = await _new_context()
+
+    # Mark this search as active to coordinate with browser shutdown.  We
+    # increment the counter at entry and decrement in the finally block.
+    async with _active_lock:
+        global _active_scrapes
+        _active_scrapes += 1
 
     try:
         total_yield = 0
@@ -373,16 +446,23 @@ async def search_numbers(
                     url = SEARCH_FMT.format(query=urllib.parse.quote_plus(q), start=start, uule=uule)
 
                     # 👉 página EFÊMERA por URL
-                    page = await context.new_page()
+                    page = await _safe_new_page(context)
+                    if not page:
+                        idx += 1
+                        continue
                     page.set_default_timeout(20000)
 
                     try:
                         try:
                             await _safe_goto(page, url, wait_until="domcontentloaded", timeout=30000)
-                        except (PWError, CancelledError):
-                            try: await page.close()
-                            except Exception: pass
-                            page = await context.new_page()
+                        except (PWError, TargetClosedError, CancelledError):
+                            # If navigation fails due to a closed target or other Playwright error,
+                            # close the page and attempt one retry with a fresh page.
+                            await _safe_close_page(page)
+                            page = await _safe_new_page(context)
+                            if not page:
+                                idx += 1
+                                continue
                             page.set_default_timeout(20000)
                             await _safe_goto(page, url, wait_until="domcontentloaded", timeout=30000)
 
@@ -393,17 +473,22 @@ async def search_numbers(
                             captcha_hits_term += 1
                             captcha_hits_global += 1
                             await page.wait_for_timeout(_cooldown_secs(captcha_hits_global) * 1000)
+                            # If we've hit too many captchas for this term, skip to next page
                             if captcha_hits_term >= 2:
                                 idx += 1
                                 continue
 
                         try:
-                            await page.wait_for_selector("a[href^='tel:']," + ",".join(RESULT_CONTAINERS), timeout=8000)
+                            await page.wait_for_selector(
+                                "a[href^='tel:']," + ",".join(RESULT_CONTAINERS),
+                                timeout=8000,
+                            )
                         except PWTimeoutError:
                             pass
 
-                        phones = await _extract_phones_from_page(page)
+                        phones: List[str] = await _extract_phones_from_page(page)
 
+                        # If no phones were found on the main search page, open individual listings.
                         if not phones:
                             try:
                                 cards = page.locator(",".join(LISTING_LINK_SELECTORS))
@@ -416,7 +501,9 @@ async def search_numbers(
                                         href = None
                                     extracted = await _open_and_extract_from_listing(context, href, seen)
                                     phones.extend(extracted)
-                                    if len(phones) >= 20: break
+                                    # Stop opening more listings once we have enough numbers
+                                    if len(phones) >= 20:
+                                        break
                             except (PWError, Exception):
                                 pass
 
@@ -427,49 +514,71 @@ async def search_numbers(
                                 new += 1
                                 total_yield += 1
                                 yield ph
+                                # If we reached the target, close the page and return
                                 if target and total_yield >= target:
-                                    try: await page.close()
-                                    except Exception: pass
+                                    await _safe_close_page(page)
                                     return
 
+                        # Increment our empty page counter if we didn't yield any new numbers
                         empty_pages = empty_pages + 1 if new == 0 else 0
                         if empty_pages >= empty_limit:
-                            try: await page.close()
-                            except Exception: pass
+                            # If too many consecutive empty pages, break out of this term
+                            await _safe_close_page(page)
                             break
 
+                        # Backoff between pages: add jitter based on the page index
                         wait_ms = random.randint(320, 620) + min(1800, int(idx * 48 + random.randint(140, 300)))
                         await page.wait_for_timeout(wait_ms)
                         idx += 1
 
-                    except (PWError, CancelledError, Exception):
-                        try: await page.close()
-                        except Exception: pass
+                    except (PWError, TargetClosedError, CancelledError, Exception):
+                        # On any error, ensure the page is closed and advance to next page
+                        await _safe_close_page(page)
                         idx += 1
                         continue
                     finally:
-                        try:
-                            if not page.is_closed():
-                                await page.close()
-                        except Exception:
-                            pass
+                        # Always close the page at the end of this iteration
+                        await _safe_close_page(page)
     finally:
-        try: await context.close()
-        except (PWError, CancelledError, Exception): pass
+        # Decrement active scrape count and close the context
+        try:
+            async with _active_lock:
+                _active_scrapes -= 1
+        finally:
+            try:
+                if context and not _is_closed(context):
+                    await context.close()
+            except (PWError, TargetClosedError, CancelledError, Exception):
+                pass
 
 async def shutdown_playwright():
     global _pw, _browser
+    # Before shutting down Playwright, wait for active scrapes to finish to
+    # avoid closing the browser mid-request.  Check the counter up to 10s.
+    try:
+        for _ in range(20):  # 20 * 0.5s = 10s
+            async with _active_lock:
+                if _active_scrapes == 0:
+                    break
+            await asyncio.sleep(0.5)
+    except Exception:
+        # Ignore any errors while waiting
+        pass
+    # Close the browser instance if present
     try:
         if _browser:
-            await _browser.close()
-    except (PWError, CancelledError, Exception):
-        pass
+            try:
+                await _browser.close()
+            except (PWError, TargetClosedError, CancelledError, Exception):
+                pass
     finally:
         _browser = None
+    # Stop the Playwright service
     try:
         if _pw:
-            await _pw.stop()
-    except (PWError, CancelledError, Exception):
-        pass
+            try:
+                await _pw.stop()
+            except (PWError, TargetClosedError, CancelledError, Exception):
+                pass
     finally:
         _pw = None
