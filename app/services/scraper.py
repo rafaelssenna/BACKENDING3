@@ -15,11 +15,31 @@ from playwright.async_api import (
 from ..config import settings
 from ..utils.phone import extract_phones_from_text, normalize_br
 
-SEARCH_FMT = "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={query}&start={start}{uule}"
+# Base search URL for Google Local search.  The tbm=lcl parameter narrows results to
+# “local” listings and hl/gl set the language/locale.  The uule suffix is a base64
+# encoded location signal that helps Google return results centred on the desired
+# city.  When updating the scraper keep this constant together with the logic in
+# `_uule_for_city` below.
+SEARCH_FMT = (
+    "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={query}&start={start}{uule}"
+)
 
-RESULT_CONTAINERS = [
-    ".rlfl__tls", ".VkpGBb", ".rllt__details", ".rllt__wrapped",
-    "div[role='article']", "#search", "div[role='main']", "#rhs", ".kp-wholepage",
+RESULT_CONTAINERS: list[str] = [
+    ".rlfl__tls",
+    ".VkpGBb",
+    ".rllt__details",
+    ".rllt__wrapped",
+    "div[role='article']",
+    "#search",
+    "div[role='main']",
+    "#rhs",
+    ".kp-wholepage",
+    # Newer Google layouts often store the phone inside an element with a
+    # data-attrid containing the word "phone"
+    "[data-attrid*='phone']",
+    # Some listings wrap phone information in spans or divs next to a label
+    "span:has-text('Telefone')",
+    "div:has-text('Telefone')",
 ]
 
 LISTING_LINK_SELECTORS = [
@@ -32,13 +52,17 @@ LISTING_LINK_SELECTORS = [
     "a[href*='/search?'][href*='lrd=']",
 ]
 
-CONSENT_BUTTONS = [
+CONSENT_BUTTONS: list[str] = [
     "button#L2AGLb",
     "button:has-text('Aceitar tudo')",
     "button:has-text('Concordo')",
     "button:has-text('Aceitar')",
+    "button:has-text('Aceitar cookies')",
+    "button:has-text('Aceitar todos')",
     "button:has-text('I agree')",
     "button:has-text('Accept all')",
+    "button:has-text('Accept')",
+    "button:has-text('Accept cookies')",
 ]
 
 UA_POOL = [
@@ -118,25 +142,70 @@ async def _humanize(page) -> None:
         pass
 
 async def _extract_phones_from_page(page) -> List[str]:
+    """
+    Extract all Brazilian phone numbers from the given Playwright page.
+
+    This helper scrapes numbers from a variety of sources:
+
+    - hrefs beginning with tel:, which directly embed the phone number;
+    - the link text of tel: anchors, to capture formatted numbers;
+    - the innerText of several container elements identified in
+      RESULT_CONTAINERS;
+    - the full page text as a fallback.  The full page is only used if
+      the above approaches yield no results and helps recover numbers that
+      Google places in dynamic elements not matched by our selectors.
+    """
     phones: Set[str] = set()
     try:
-        hrefs = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.getAttribute('href'))")
+        # 1. Extract numbers from tel: hrefs
+        hrefs: list[str] = await page.eval_on_selector_all(
+            "a[href^='tel:']",
+            "els => els.map(e => e.getAttribute('href'))",
+        )
         for h in hrefs or []:
             n = normalize_br((h or "").replace("tel:", ""))
-            if n: phones.add(n)
-        texts = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.innerText || e.textContent || '')")
+            if n:
+                phones.add(n)
+
+        # 2. Extract numbers from the visible text of tel: anchors
+        texts: list[str] = await page.eval_on_selector_all(
+            "a[href^='tel:']",
+            "els => els.map(e => e.innerText || e.textContent || '')",
+        )
         for t in texts or []:
             n = normalize_br(t)
-            if n: phones.add(n)
+            if n:
+                phones.add(n)
+
+        # 3. Scan specific containers for numbers using regex
         for sel in RESULT_CONTAINERS:
             try:
-                blocks = await page.eval_on_selector_all(sel, "els => els.map(e => e.innerText || e.textContent || '')")
-                for block in blocks or []:
-                    for n in extract_phones_from_text(block):
-                        phones.add(n)
+                blocks: list[str] = await page.eval_on_selector_all(
+                    sel,
+                    "els => els.map(e => e.innerText || e.textContent || '')",
+                )
             except Exception:
                 continue
+            for block in blocks or []:
+                for num in extract_phones_from_text(block):
+                    phones.add(num)
+
+        # 4. As a last resort, scan the entire body text.  This fallback
+        # avoids over-reliance on CSS selectors when Google changes its
+        # markup.  Only run this step if no numbers were found in the
+        # earlier steps to minimize processing.
+        if not phones:
+            try:
+                body_text: str = await page.evaluate(
+                    "() => document.body ? document.body.innerText : ''"
+                )
+                for num in extract_phones_from_text(body_text):
+                    phones.add(num)
+            except Exception:
+                pass
     except Exception:
+        # We swallow all exceptions to avoid cancelling the outer search;
+        # upstream code handles recovery and retry.
         pass
     return list(phones)
 
@@ -148,11 +217,30 @@ def _city_variants(city: str) -> List[str]:
     return list(dict.fromkeys(variants))
 
 async def _is_captcha_or_sorry(page) -> bool:
+    """
+    Detect whether the current page is a CAPTCHA/"unusual traffic" interstitial.
+
+    Google sometimes presents "Sorry, your request looks like automated" pages or
+    reCAPTCHA challenges when it detects scraping.  This function inspects
+    the initial portion of the DOM to look for characteristic markers.  It
+    returns True if a CAPTCHA or "unusual traffic" page is detected, else False.
+    """
     try:
         txt = (await page.content())[:120000].lower()
-        if "/sorry/" in txt or "unusual traffic" in txt or "recaptcha" in txt or "g-recaptcha" in txt:
+        # Common substrings indicating a CAPTCHA or a sorry page
+        markers = [
+            "/sorry/",
+            "unusual traffic",
+            "our systems have detected",
+            "detected unusual traffic",
+            "recaptcha",
+            "g-recaptcha",
+        ]
+        if any(m in txt for m in markers):
             return True
-        sel_hit = await page.locator("form[action*='/sorry'], iframe[src*='recaptcha'], #recaptcha").count()
+        sel_hit = await page.locator(
+            "form[action*='/sorry'], iframe[src*='recaptcha'], #recaptcha"
+        ).count()
         return sel_hit > 0
     except Exception:
         return False
