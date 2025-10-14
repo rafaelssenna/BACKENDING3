@@ -382,8 +382,8 @@ async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> 
             await page2.wait_for_timeout(1000)
             phones = await _extract_phones_from_page(page2)
             for ph in phones:
+                # Do not mutate the global seen set here; just avoid duplicates locally.
                 if ph not in seen:
-                    seen.add(ph)
                     out.append(ph)
     except (PWError, TargetClosedError, CancelledError, Exception):
         # Swallow exceptions; extraction failures should not bubble
