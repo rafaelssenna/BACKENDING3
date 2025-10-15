@@ -5,7 +5,7 @@ import random
 import urllib.parse
 import base64
 import unicodedata
-from typing import AsyncGenerator, List, Set, Optional
+from typing import AsyncGenerator, List, Set, Optional, Dict
 
 from playwright.async_api import (
     async_playwright,
@@ -44,6 +44,17 @@ CONSENT_BUTTONS = [
     "button:has-text('Aceitar')",
     "button:has-text('I agree')",
     "button:has-text('Accept all')",
+]
+
+# Nome do estabelecimento: seletores comuns em SERP/Maps
+NAME_CANDIDATES = [
+    ".DUwDvf",              # título no Google Maps
+    "h1", "h2", "h3",
+    ".dbg0pd",
+    ".rllt__details > div:first-child",
+    "[role='heading'] span",
+    ".qrShPb span",
+    ".SPZz6b span",
 ]
 
 UA_POOL = [
@@ -122,28 +133,106 @@ async def _humanize(page) -> None:
     except Exception:
         pass
 
-async def _extract_phones_from_page(page) -> List[str]:
-    phones: Set[str] = set()
+async def _closest_name_for(page, element) -> Optional[str]:
     try:
-        hrefs = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.getAttribute('href'))")
-        for h in hrefs or []:
-            n = normalize_br((h or "").replace("tel:", ""))
-            if n: phones.add(n)
-        texts = await page.eval_on_selector_all("a[href^='tel:']", "els => els.map(e => e.innerText || e.textContent || '')")
-        for t in texts or []:
-            n = normalize_br(t)
-            if n: phones.add(n)
-        for sel in RESULT_CONTAINERS:
+        # Busca um contêiner pertinente e tenta extrair um "título" dentro dele.
+        return await page.evaluate(
+            f"""(el) => {{
+                let node = el.closest('.VkpGBb,.dbg0pd,[role="article"],.rllt__details,.rlfl__tls,#search,.kp-wholepage') || el.parentElement;
+                const sels = {NAME_CANDIDATES!r};
+                while (node) {{
+                  for (const s of sels) {{
+                    const cand = node.querySelector(s);
+                    if (cand && cand.textContent) {{
+                      const t = cand.textContent.trim();
+                      if (t) return t;
+                    }}
+                  }}
+                  node = node.parentElement;
+                }}
+                return null;
+            }}""",
+            element,
+        )
+    except Exception:
+        return None
+
+async def _extract_phones_from_page(page) -> List[Dict[str, Optional[str]]]:
+    """
+    Extrai pares {name, phone} da página atual.
+    - Prioriza <a href="tel:"> e tenta achar o nome "próximo".
+    - Faz varredura dos contêineres conhecidos e tenta casar um heading do card.
+    - Como último recurso, varre o body inteiro e extrai apenas o telefone.
+    """
+    leads: Dict[str, Dict[str, Optional[str]]] = {}
+    try:
+        # 1) Telefones clicáveis (anchors tel:) + nome mais próximo
+        anchors = await page.query_selector_all("a[href^='tel:']")
+        for a in anchors or []:
             try:
-                blocks = await page.eval_on_selector_all(sel, "els => els.map(e => e.innerText || e.textContent || '')")
-                for block in blocks or []:
-                    for n in extract_phones_from_text(block):
-                        phones.add(n)
+                href = (await a.get_attribute("href")) or ""
+                text = (await a.inner_text()) or (await a.text_content()) or ""
+                phone = normalize_br(href.replace("tel:", "")) or normalize_br(text)
+                if not phone:
+                    continue
+                name = await _closest_name_for(page, a)
+                if phone not in leads:
+                    leads[phone] = {"phone": phone, "name": (name or None)}
             except Exception:
                 continue
+
+        # 2) Blocos de resultados: tenta achar phones + heading dentro do bloco
+        for sel in RESULT_CONTAINERS:
+            try:
+                blocks = await page.query_selector_all(sel)
+                for block in blocks or []:
+                    try:
+                        txt = (await block.inner_text()) or ""
+                    except Exception:
+                        txt = ""
+                    if not txt:
+                        continue
+                    extracted = extract_phones_from_text(txt)
+                    if not extracted:
+                        continue
+                    # nome do bloco (se houver)
+                    try:
+                        name_in_block = await page.evaluate(
+                            f"""(el) => {{
+                                const sels = {NAME_CANDIDATES!r};
+                                for (const s of sels) {{
+                                   const c = el.querySelector(s);
+                                   if (c && c.textContent) {{
+                                       const t = c.textContent.trim();
+                                       if (t) return t;
+                                   }}
+                                }}
+                                return null;
+                            }}""",
+                            block,
+                        )
+                    except Exception:
+                        name_in_block = None
+                    for ph in extracted:
+                        if ph not in leads:
+                            leads[ph] = {"phone": ph, "name": (name_in_block or leads.get(ph, {}).get("name"))}
+            except Exception:
+                continue
+
+        # 3) Fallback absoluto: varre o body inteiro
+        if not leads:
+            try:
+                body_text = await page.evaluate("() => document.body ? (document.body.innerText || '') : ''")
+            except Exception:
+                body_text = ""
+            for ph in extract_phones_from_text(body_text or ""):
+                if ph not in leads:
+                    leads[ph] = {"phone": ph, "name": None}
+
     except Exception:
         pass
-    return list(phones)
+
+    return list(leads.values())
 
 def _city_variants(city: str) -> List[str]:
     c = _city_alias(city)
@@ -179,17 +268,8 @@ _browser = None
 _pw_lock = asyncio.Lock()
 
 async def _ensure_browser():
-    """Ensure that a single Playwright browser instance is running.
-
-    This function lazily starts Playwright and launches the configured
-    browser type. A per‑module lock prevents concurrent initialisation.
-    Logging statements record when the browser or Playwright are started.
-
-    Returns:
-        The running Playwright browser instance.
-    """
+    """Ensure that a single Playwright browser instance is running."""
     global _pw, _browser
-    # Acquire a global lock to avoid race conditions during start
     async with _pw_lock:
         if _pw is None:
             log.info("Starting Playwright…")
@@ -205,16 +285,11 @@ async def _ensure_browser():
             }
             log.info(f"Launching {settings.BROWSER} browser (headless={settings.HEADLESS})…")
             _browser = await getattr(_pw, settings.BROWSER).launch(**launch_args)
-        return _browser
+    return _browser
 
 async def _new_context():
     browser = await _ensure_browser()
     ua = settings.USER_AGENT or random.choice(UA_POOL)
-    # Optional proxy support. If a proxy server is defined in the configuration
-    # (e.g. via the PROXY_SERVER environment variable), Playwright will route
-    # all traffic through it. This is useful when you need to rotate IP
-    # addresses or bypass regional restrictions. When not set, no proxy is
-    # configured and Playwright connects directly.
     proxy_kwargs = {}
     proxy_server = getattr(settings, "PROXY_SERVER", None)
     if proxy_server:
@@ -228,10 +303,6 @@ async def _new_context():
         viewport={"width": random.randint(1200, 1360), "height": random.randint(820, 920)},
         **proxy_kwargs,
     )
-
-    # Mask automation fingerprints: remove webdriver flag and fake languages,
-    # plugins and chrome runtime. These changes help avoid simple bot
-    # detections on Google and other sites.
     await context.add_init_script(
         """
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -254,8 +325,8 @@ async def _safe_goto(page, url: str, **kw):
         raise
 
 # ---------- abrir ficha ----------
-async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> List[str]:
-    out: List[str] = []
+async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> List[Dict[str, Optional[str]]]:
+    out: List[Dict[str, Optional[str]]] = []
     if not href: return out
     if href.startswith("/"): href = "https://www.google.com" + href
 
@@ -271,11 +342,12 @@ async def _open_and_extract_from_listing(context, href: str, seen: Set[str]) -> 
             except Exception:
                 pass
         await page2.wait_for_timeout(1000)
-        phones = await _extract_phones_from_page(page2)
-        for ph in phones:
-            if ph not in seen:
+        leads = await _extract_phones_from_page(page2)
+        for lead in leads:
+            ph = lead.get("phone")
+            if ph and ph not in seen:
                 seen.add(ph)
-                out.append(ph)
+                out.append(lead)
     except (PWError, CancelledError, Exception):
         pass
     finally:
@@ -290,17 +362,14 @@ async def search_numbers(
     target: int,
     *,
     max_pages: Optional[int] = None,
-) -> AsyncGenerator[str, None]:
+) -> AsyncGenerator[Dict[str, Optional[str]], None]:
     seen: Set[str] = set()
     q_base = _clean_query(nicho)
     empty_limit = int(getattr(settings, "MAX_EMPTY_PAGES", 14))
     captcha_hits_global = 0
 
     context = await _new_context()
-    # Log the start of a scraping job with the supplied parameters.
-    log.info(
-        f"Starting phone search: nicho='{nicho}', locais={locais}, target={target}, max_pages={max_pages}"
-    )
+    log.info(f"Starting phone search: nicho='{nicho}', locais={locais}, target={target}, max_pages={max_pages}")
 
     try:
         total_yield = 0
@@ -320,8 +389,6 @@ async def search_numbers(
                 empty_pages = 0
                 idx = 0
                 captcha_hits_term = 0
-
-                # Log each search term for clarity. Terms include variations of the niche and city.
                 log.info(f"Searching term '{term}' in city '{city}'")
 
                 while True:
@@ -336,7 +403,6 @@ async def search_numbers(
 
                     url = SEARCH_FMT.format(query=urllib.parse.quote_plus(q), start=start, uule=uule)
 
-                    # 👉 página EFÊMERA por URL
                     page = await context.new_page()
                     page.set_default_timeout(20000)
 
@@ -356,14 +422,10 @@ async def search_numbers(
                         if await _is_captcha_or_sorry(page):
                             captcha_hits_term += 1
                             captcha_hits_global += 1
-                            log.warning(
-                                f"CAPTCHA or unusual traffic detected (term='{term}', city='{city}', hit={captcha_hits_term}, global_hits={captcha_hits_global})."
-                            )
+                            log.warning(f"CAPTCHA or unusual traffic detected (term='{term}', city='{city}', hit={captcha_hits_term}, global_hits={captcha_hits_global}).")
                             await page.wait_for_timeout(_cooldown_secs(captcha_hits_global) * 1000)
                             if captcha_hits_term >= 2:
-                                log.info(
-                                    f"Skipping to next page for term '{term}' due to repeated CAPTCHA hits"
-                                )
+                                log.info(f"Skipping to next page for term '{term}' due to repeated CAPTCHA hits")
                                 idx += 1
                                 continue
 
@@ -372,24 +434,13 @@ async def search_numbers(
                         except PWTimeoutError:
                             pass
 
-                        phones = await _extract_phones_from_page(page)
+                        leads = await _extract_phones_from_page(page)
 
-                        if not phones:
-                            # When no phone numbers are found directly on the search
-                            # results page we open each business listing to extract
-                            # potential phone numbers. To speed up extraction and
-                            # reduce overall scraping time we open a few listings
-                            # concurrently. Concurrency is limited by the
-                            # LISTING_CONCURRENCY setting to avoid spawning too
-                            # many pages at once which could trigger bot
-                            # protections. Results are aggregated and we break
-                            # early once enough new numbers are collected.
+                        if not leads:
                             try:
                                 cards = page.locator(",".join(LISTING_LINK_SELECTORS))
                                 count = await cards.count()
-                                # limit the total number of listings to inspect
                                 to_open = min(count, 12)
-                                # concurrency limit from settings
                                 max_conc = max(1, int(getattr(settings, "LISTING_CONCURRENCY", 3)))
                                 tasks: List[asyncio.Task] = []
                                 for i in range(to_open):
@@ -397,61 +448,51 @@ async def search_numbers(
                                         href = await cards.nth(i).get_attribute("href")
                                     except (PWError, Exception):
                                         href = None
-                                    # schedule listing extraction
                                     tasks.append(asyncio.create_task(_open_and_extract_from_listing(context, href, seen)))
-                                    # if we reached concurrency limit, flush tasks
                                     if len(tasks) >= max_conc:
                                         results = await asyncio.gather(*tasks, return_exceptions=True)
                                         tasks.clear()
                                         for res in results:
                                             if isinstance(res, Exception):
                                                 continue
-                                            phones.extend(res)
-                                            if len(phones) >= 20:
-                                                break
-                                    # check again after flush
-                                    if len(phones) >= 20:
+                                            leads.extend(res)
+                                            if len(leads) >= 20: break
+                                    if len(leads) >= 20:
                                         break
-                                # flush any remaining tasks
-                                if tasks and len(phones) < 20:
+                                if tasks and len(leads) < 20:
                                     results = await asyncio.gather(*tasks, return_exceptions=True)
                                     tasks.clear()
                                     for res in results:
                                         if isinstance(res, Exception):
                                             continue
-                                        phones.extend(res)
-                                        if len(phones) >= 20:
-                                            break
+                                        leads.extend(res)
+                                        if len(leads) >= 20: break
                             except (PWError, Exception):
                                 pass
 
                         new = 0
-                        for ph in phones:
+                        for lead in leads:
+                            ph = (lead or {}).get("phone")
+                            nm = (lead or {}).get("name")
+                            if not ph:
+                                continue
                             if ph not in seen:
                                 seen.add(ph)
                                 new += 1
                                 total_yield += 1
-                                log.debug(f"New phone found: {ph}")
-                                yield ph
+                                log.debug(f"New lead: {nm or '(sem nome)'} — {ph}")
+                                yield {"phone": ph, "name": nm}
                                 if target and total_yield >= target:
-                                    log.info(
-                                        f"Target of {target} phone numbers reached. Terminating search."
-                                    )
-                                    try:
-                                        await page.close()
-                                    except Exception:
-                                        pass
+                                    log.info(f"Target of {target} leads reached. Terminating search.")
+                                    try: await page.close()
+                                    except Exception: pass
                                     return
 
                         empty_pages = empty_pages + 1 if new == 0 else 0
                         if empty_pages >= empty_limit:
-                            log.info(
-                                f"Reached empty page limit ({empty_limit}) for term '{term}'. Moving to next term."
-                            )
-                            try:
-                                await page.close()
-                            except Exception:
-                                pass
+                            log.info(f"Reached empty page limit ({empty_limit}) for term '{term}'. Moving to next term.")
+                            try: await page.close()
+                            except Exception: pass
                             break
 
                         wait_ms = random.randint(320, 620) + min(1800, int(idx * 48 + random.randint(140, 300)))
@@ -470,17 +511,14 @@ async def search_numbers(
                         except Exception:
                             pass
     finally:
-        # Always close the context to free browser resources, and log summary.
         try:
             await context.close()
         except (PWError, CancelledError, Exception):
             pass
-        log.info(f"Search completed. Total numbers yielded: {total_yield}")
+        log.info(f"Search completed. Total leads yielded: {total_yield}")
 
 async def shutdown_playwright():
     global _pw, _browser
-    # Log that we are shutting down Playwright and the browser. This can
-    # help diagnose unexpected closures.
     log.info("Shutting down Playwright and browser…")
     try:
         if _browser:
