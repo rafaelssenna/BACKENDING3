@@ -14,6 +14,11 @@ from playwright.async_api import (
 )
 from ..config import settings
 from ..utils.phone import extract_phones_from_text, normalize_br
+from ..utils.logs import setup_logger
+
+# Initialise a module‑level logger. Using a single logger ensures
+# consistent formatting and avoids reattaching handlers on each import.
+log = setup_logger("scraper")
 
 SEARCH_FMT = "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={query}&start={start}{uule}"
 
@@ -165,17 +170,42 @@ def _cooldown_secs(hit: int) -> int:
 _pw = None
 _browser = None
 
+# A global lock used to serialise Playwright initialisation. Without
+# this lock multiple concurrent calls to `_ensure_browser` could try to
+# start Playwright or launch a browser at the same time, leading to
+# race conditions and unpredictable failures. The lock is held only
+# around the startup section and does not impact subsequent browser
+# usage. See `_ensure_browser` for details.
+_pw_lock = asyncio.Lock()
+
 async def _ensure_browser():
+    """Ensure that a single Playwright browser instance is running.
+
+    This function lazily starts Playwright and launches the configured
+    browser type. A per‑module lock prevents concurrent initialisation.
+    Logging statements record when the browser or Playwright are started.
+
+    Returns:
+        The running Playwright browser instance.
+    """
     global _pw, _browser
-    if _pw is None:
-        _pw = await async_playwright().start()
-    if _browser is None:
-        launch_args = {
-            "headless": settings.HEADLESS,
-            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
-        }
-        _browser = await getattr(_pw, settings.BROWSER).launch(**launch_args)
-    return _browser
+    # Acquire a global lock to avoid race conditions during start
+    async with _pw_lock:
+        if _pw is None:
+            log.info("Starting Playwright…")
+            _pw = await async_playwright().start()
+        if _browser is None:
+            launch_args = {
+                "headless": settings.HEADLESS,
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            }
+            log.info(f"Launching {settings.BROWSER} browser (headless={settings.HEADLESS})…")
+            _browser = await getattr(_pw, settings.BROWSER).launch(**launch_args)
+        return _browser
 
 async def _new_context():
     browser = await _ensure_browser()
@@ -267,6 +297,10 @@ async def search_numbers(
     captcha_hits_global = 0
 
     context = await _new_context()
+    # Log the start of a scraping job with the supplied parameters.
+    log.info(
+        f"Starting phone search: nicho='{nicho}', locais={locais}, target={target}, max_pages={max_pages}"
+    )
 
     try:
         total_yield = 0
@@ -286,6 +320,9 @@ async def search_numbers(
                 empty_pages = 0
                 idx = 0
                 captcha_hits_term = 0
+
+                # Log each search term for clarity. Terms include variations of the niche and city.
+                log.info(f"Searching term '{term}' in city '{city}'")
 
                 while True:
                     if target and total_yield >= target: return
@@ -319,8 +356,14 @@ async def search_numbers(
                         if await _is_captcha_or_sorry(page):
                             captcha_hits_term += 1
                             captcha_hits_global += 1
+                            log.warning(
+                                f"CAPTCHA or unusual traffic detected (term='{term}', city='{city}', hit={captcha_hits_term}, global_hits={captcha_hits_global})."
+                            )
                             await page.wait_for_timeout(_cooldown_secs(captcha_hits_global) * 1000)
                             if captcha_hits_term >= 2:
+                                log.info(
+                                    f"Skipping to next page for term '{term}' due to repeated CAPTCHA hits"
+                                )
                                 idx += 1
                                 continue
 
@@ -388,16 +431,27 @@ async def search_numbers(
                                 seen.add(ph)
                                 new += 1
                                 total_yield += 1
+                                log.debug(f"New phone found: {ph}")
                                 yield ph
                                 if target and total_yield >= target:
-                                    try: await page.close()
-                                    except Exception: pass
+                                    log.info(
+                                        f"Target of {target} phone numbers reached. Terminating search."
+                                    )
+                                    try:
+                                        await page.close()
+                                    except Exception:
+                                        pass
                                     return
 
                         empty_pages = empty_pages + 1 if new == 0 else 0
                         if empty_pages >= empty_limit:
-                            try: await page.close()
-                            except Exception: pass
+                            log.info(
+                                f"Reached empty page limit ({empty_limit}) for term '{term}'. Moving to next term."
+                            )
+                            try:
+                                await page.close()
+                            except Exception:
+                                pass
                             break
 
                         wait_ms = random.randint(320, 620) + min(1800, int(idx * 48 + random.randint(140, 300)))
@@ -416,11 +470,18 @@ async def search_numbers(
                         except Exception:
                             pass
     finally:
-        try: await context.close()
-        except (PWError, CancelledError, Exception): pass
+        # Always close the context to free browser resources, and log summary.
+        try:
+            await context.close()
+        except (PWError, CancelledError, Exception):
+            pass
+        log.info(f"Search completed. Total numbers yielded: {total_yield}")
 
 async def shutdown_playwright():
     global _pw, _browser
+    # Log that we are shutting down Playwright and the browser. This can
+    # help diagnose unexpected closures.
+    log.info("Shutting down Playwright and browser…")
     try:
         if _browser:
             await _browser.close()
