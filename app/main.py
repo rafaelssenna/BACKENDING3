@@ -1,7 +1,7 @@
 # app/main.py
 import json
 from io import StringIO
-from typing import List
+from typing import List, Dict, Tuple, Any
 from asyncio import CancelledError
 import asyncio
 
@@ -22,7 +22,7 @@ except Exception:
 from .services.verifier import verify_batch
 from .auth import router as auth_router, verify_access_via_query
 
-app = FastAPI(title="ClickLeads Backend", version="2.1.2")
+app = FastAPI(title="ClickLeads Backend", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,6 +53,17 @@ def _scrape_cap(remaining: int, somente_wa: bool) -> int:
     # quando filtra por WA, precisamos sobre-amostrar
     return max(remaining * (16 if somente_wa else 1), 300 if somente_wa else 100)
 
+def _lead_tuple(item: Any) -> Tuple[str, str | None]:
+    """
+    Aceita string (+55...) ou dict {"phone","name"} e retorna (phone, name).
+    Mantém compatibilidade se algum scraper antigo retornar apenas string.
+    """
+    if isinstance(item, dict):
+        ph = str(item.get("phone") or "").strip()
+        nm = (item.get("name") or "").strip() or None
+        return ph, nm
+    return str(item or "").strip(), None
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -76,7 +87,8 @@ async def leads_stream(
         delivered = 0
         non_wa = 0
         searched = 0
-        vistos = set()
+        vistos: set[str] = set()
+        name_by_phone: Dict[str, str | None] = {}
 
         base_batch = _batch_size(target)
         min_batch = min(8, base_batch)
@@ -104,7 +116,7 @@ async def leads_stream(
             for p in ok:
                 if delivered < target:
                     delivered += 1
-                    yield sse("item", {"phone": p, "has_whatsapp": True})
+                    yield sse("item", {"phone": p, "name": name_by_phone.get(p), "has_whatsapp": True})
                     if delivered >= target:
                         break
             yield sse("progress", {
@@ -122,20 +134,23 @@ async def leads_stream(
 
             # 1ª passada: coleta de candidatos (sobre-amostra se somente_wa)
             scrape_cap = _scrape_cap(target - delivered, somente_wa)
-            async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
+            async for item in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
                 tick = maybe_tick()
                 if tick: yield tick
 
                 if delivered >= target:
                     break
+
+                ph, nm = _lead_tuple(item)
                 if not ph or ph in vistos:
                     continue
                 vistos.add(ph)
                 searched += 1
+                name_by_phone.setdefault(ph, nm)
 
                 if not somente_wa:
                     delivered += 1
-                    yield sse("item", {"phone": ph})
+                    yield sse("item", {"phone": ph, "name": nm, "has_whatsapp": False})
                     yield sse("progress", {
                         "wa_count": delivered, "non_wa_count": non_wa,
                         "searched": searched, "city": cidade
@@ -154,16 +169,20 @@ async def leads_stream(
             if somente_wa and delivered < target:
                 extra_needed = target - delivered
                 extra_cap = _scrape_cap(extra_needed, True)
-                async for ph in search_numbers(nicho, [cidade], extra_cap, max_pages=None):
+                async for item in search_numbers(nicho, [cidade], extra_cap, max_pages=None):
                     tick = maybe_tick()
                     if tick: yield tick
 
                     if delivered >= target:
                         break
+
+                    ph, nm = _lead_tuple(item)
                     if not ph or ph in vistos:
                         continue
                     vistos.add(ph)
                     searched += 1
+                    name_by_phone.setdefault(ph, nm)
+
                     pool.append(ph)
                     if len(pool) >= min_batch and delivered < target:
                         async for chunk in flush_pool(pool[:min_batch]): yield chunk
@@ -227,11 +246,12 @@ async def leads(
     cidade = _cidade(local)
     target = n
 
-    items: List[str] = []
+    items: List[Dict[str, Any]] = []  # cada item: {"phone":..., "name":...}
     delivered = 0
     non_wa = 0
     searched = 0
-    vistos = set()
+    vistos: set[str] = set()
+    name_by_phone: Dict[str, str | None] = {}
 
     base_batch = _batch_size(target)
     min_batch = min(8, base_batch)
@@ -241,13 +261,15 @@ async def leads(
 
         # 1ª passada
         scrape_cap = _scrape_cap(target - delivered, somente_wa)
-        async for ph in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
+        async for item in search_numbers(nicho, [cidade], scrape_cap, max_pages=None):
             if delivered >= target: break
+            ph, nm = _lead_tuple(item)
             if not ph or ph in vistos: continue
             vistos.add(ph); searched += 1
+            name_by_phone.setdefault(ph, nm)
 
             if not somente_wa:
-                items.append(ph); delivered += 1
+                items.append({"phone": ph, "name": nm}); delivered += 1
                 continue
 
             pool.append(ph)
@@ -260,10 +282,10 @@ async def leads(
                 non_wa += len(bad)
                 for p in ok:
                     if delivered < target:
-                        items.append(p); delivered += 1
+                        items.append({"phone": p, "name": name_by_phone.get(p)}); delivered += 1
                         if delivered >= target: break
 
-        # 2ª passada se necessário
+        # 2ª passada se necessário (e ainda há pool pendente)
         if somente_wa and delivered < target and pool:
             try:
                 ok, bad = await verify_batch(pool, batch_size=len(pool))
@@ -272,13 +294,14 @@ async def leads(
             non_wa += len(bad)
             for p in ok:
                 if delivered < target:
-                    items.append(p); delivered += 1
+                    items.append({"phone": p, "name": name_by_phone.get(p)}); delivered += 1
                     if delivered >= target: break
 
     except Exception:
         pass
 
-    data = [{"phone": p, "has_whatsapp": bool(verify)} for p in items[:target]]
+    # payload padronizado
+    data = [{"phone": r["phone"], "name": r.get("name"), "has_whatsapp": bool(verify)} for r in items[:target]]
     return JSONResponse({
         "items": data,
         "leads": data,
@@ -303,9 +326,13 @@ async def export_get(
 ):
     resp = await leads(nicho=nicho, local=local, n=n, verify=verify)
     payload = json.loads(resp.body.decode("utf-8"))
-    phones = [row["phone"] for row in payload.get("items", [])]
-    buf = StringIO(); buf.write("phone\n")
-    for p in phones: buf.write(str(p).strip() + "\n")
+    rows = payload.get("items", [])
+    buf = StringIO(); buf.write("name,phone\n")
+    for r in rows:
+        nm = str(r.get("name") or "").replace(",", " ").strip()
+        ph = str(r.get("phone") or "").strip()
+        if ph:
+            buf.write(f"{nm},{ph}\n")
     csv = buf.getvalue().encode("utf-8")
     filename = f"leads_{nicho.strip().replace(' ','_')}_{_cidade(local).replace(' ','_')}.csv"
     return _csv_response(csv, filename)
