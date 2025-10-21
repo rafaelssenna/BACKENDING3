@@ -1,12 +1,43 @@
 # app/auth.py
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
-import os, secrets, jwt
+import os
+import secrets
+# Attempt to import PyJWT.  In some environments the `jwt` module may
+# not be installed.  We set it to `None` when missing and perform
+# runtime checks before using it.
+try:
+    import jwt  # type: ignore
+except ImportError:  # pragma: no cover -- allow import when PyJWT missing
+    jwt = None  # type: ignore
 
 from fastapi import APIRouter, Depends, HTTPException, Response, Header, Cookie, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
-from passlib.hash import argon2, bcrypt
+# Passlib provides secure password hashing and verification.  If the
+# library is not installed, we provide dummy implementations that
+# raise informative errors when used.  This allows the module to be
+# imported in environments where passlib is missing, though user
+# creation and login will not function.
+try:
+    from passlib.hash import argon2, bcrypt  # type: ignore
+except ImportError:  # pragma: no cover -- fallback when passlib missing
+    class _DummyHasher:
+        """Fallback hasher used when passlib.hash is unavailable."""
+
+        def hash(self, *args, **kwargs):
+            raise ImportError(
+                "The 'passlib' package is required for password hashing. Install passlib to use this function."
+            )
+
+        def verify(self, *args, **kwargs):
+            raise ImportError(
+                "The 'passlib' package is required for password verification. Install passlib to use this function."
+            )
+
+    # Provide dummy instances for both argon2 and bcrypt with the same behaviour
+    argon2 = _DummyHasher()  # type: ignore
+    bcrypt = _DummyHasher()  # type: ignore
 from sqlalchemy import (
     Column, Integer, String, Boolean, DateTime,
     create_engine, select, delete, func, desc, and_
@@ -100,10 +131,27 @@ def db():
         s.close()
 
 def make_access_token(user_id: int, device_id: str, sid: str) -> str:
-    payload = {"sub": user_id, "dev": device_id, "sid": sid,
-               "exp": datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MIN),
-               "iat": datetime.utcnow()}
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+    """Generate a signed JWT for the given user and device.
+
+    This helper constructs a payload containing the subject (user ID),
+    device ID and session ID, along with issued at and expiry timestamps.
+    If the PyJWT library is available, the payload is encoded using the
+    HS256 algorithm and the configured secret.  When PyJWT is not
+    installed, an ImportError will be raised to avoid generating
+    unsigned tokens silently.
+    """
+    payload = {
+        "sub": user_id,
+        "dev": device_id,
+        "sid": sid,
+        "exp": datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MIN),
+        "iat": datetime.utcnow(),
+    }
+    if jwt is None:
+        raise ImportError(
+            "PyJWT is required to generate access tokens. Install the 'PyJWT' package."
+        )
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")  # type: ignore[no-any-return]
 
 def set_refresh_cookie(resp: Response, token: str):
     resp.set_cookie(
