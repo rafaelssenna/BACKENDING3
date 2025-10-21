@@ -81,13 +81,28 @@ CONSENT_BUTTONS = [
 # Candidate selectors for extracting business names from a card or page.
 # These are evaluated when attempting to find a name near a phone number.
 NAME_CANDIDATES = [
-    ".DUwDvf",  # heading in Google Maps
+    ".DUwDvf",  # heading in Google Maps (ficha)
+    "h1[role='heading'] span",
+    "h1[role='heading']",
     "h1",
     "h2",
     "h3",
     ".dbg0pd",
     ".rllt__details > div:first-child",
-    "[role='heading'] span",
+    "div[role='heading'] span",
+    ".qrShPb span",
+    ".SPZz6b span",
+    ".qBF1Pd",
+    ".fontHeadlineSmall",
+    ".OSrXXb",
+]
+
+# Selectors com prioridade para o NOME EXATO do card (na ficha)
+PRIMARY_NAME_SELECTORS = [
+    ".DUwDvf",                         # título principal da ficha
+    "h1[role='heading'] span",
+    "h1[role='heading']",
+    "meta[itemprop='name']::attr(content)",  # atributo content
     ".qrShPb span",
     ".SPZz6b span",
 ]
@@ -228,6 +243,42 @@ async def _humanize(page) -> None:
         pass
 
 
+async def _primary_business_name(page) -> Optional[str]:
+    """
+    Return the main business name when on the listing detail page (Google Maps card).
+    Prioritises the exact card title and safe fallbacks.
+    """
+    try:
+        # meta[itemprop='name'] requires attribute access, handle separately
+        meta = await page.locator("meta[itemprop='name']").count()
+        if meta > 0:
+            content = await page.locator("meta[itemprop='name']").first.get_attribute("content")
+            if content and content.strip():
+                return content.strip()
+
+        for sel in [s for s in PRIMARY_NAME_SELECTORS if "::attr" not in s and "meta" not in s]:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                text = await loc.first.text_content()
+                if text:
+                    t = text.strip()
+                    if t:
+                        return t
+
+        # As a very last resort, try <title> and strip suffixes " - Google Maps"/" – Google Maps"
+        title_loc = page.locator("title")
+        if await title_loc.count() > 0:
+            t = (await title_loc.first.text_content()) or ""
+            t = t.replace(" - Google Maps", "").replace(" – Google Maps", "")
+            t = t.replace(" - Pesquisa Google", "").replace(" – Pesquisa Google", "")
+            t = t.strip()
+            if t:
+                return t
+    except Exception:
+        pass
+    return None
+
+
 async def _closest_name_for(page, element) -> Optional[str]:
     """
     Given a DOM element (typically a phone link), find the closest
@@ -237,7 +288,8 @@ async def _closest_name_for(page, element) -> Optional[str]:
     """
     try:
         # Evaluate in the page context: search upwards for a container and
-        # query candidate selectors within that container
+        # query candidate selectors within that container. If nothing found,
+        # try aria-label of the anchor to the listing.
         return await page.evaluate(
             f"""(el) => {{
                 let node = el.closest('.VkpGBb,.dbg0pd,[role="article"],.rllt__details,.rlfl__tls,#search,.kp-wholepage') || el.parentElement;
@@ -250,6 +302,12 @@ async def _closest_name_for(page, element) -> Optional[str]:
                       if (t) return t;
                     }}
                   }}
+                  // tenta via aria-label do link de card
+                  const a = node.querySelector('a[href*="/maps/place"],a[href*="/local/place"]');
+                  if (a) {{
+                      const al = (a.getAttribute('aria-label') || a.textContent || '').trim();
+                      if (al) return al;
+                  }}
                   node = node.parentElement;
                 }}
                 return null;
@@ -260,7 +318,7 @@ async def _closest_name_for(page, element) -> Optional[str]:
         return None
 
 
-async def _extract_phones_from_page(page) -> List[Dict[str, Optional[str]]]:
+async def _extract_phones_from_page(page, default_name: Optional[str] = None) -> List[Dict[str, Optional[str]]]:
     """
     Extract phone numbers and corresponding business names from the current
     page. The return value is a list of dictionaries with 'phone' and
@@ -269,16 +327,19 @@ async def _extract_phones_from_page(page) -> List[Dict[str, Optional[str]]]:
 
     The function performs extraction in multiple passes:
     1. Clickable tel: links are processed, and a nearby name is
-       attempted.
+       attempted (or the primary card name if available).
     2. Known result container blocks are scanned; any phone numbers
        found within them are associated with a heading or title found
-       inside the same block.
+       inside the same block (fallback to primary name if present).
     3. As a fallback, the entire page's inner text is scanned for phone
-       numbers without associating names.
+       numbers; if a primary name exists, it is used.
     """
     leads: Dict[str, Dict[str, Optional[str]]] = {}
     try:
-        # Pass 1: <a href="tel:"> anchors and their text
+        # Se estivermos numa FICHA, este será o nome exato do card.
+        primary = default_name or await _primary_business_name(page)
+
+        # Passo 1: <a href="tel:"> anchors e seu texto
         anchors = await page.query_selector_all("a[href^='tel:']")
         for a in anchors or []:
             try:
@@ -287,13 +348,13 @@ async def _extract_phones_from_page(page) -> List[Dict[str, Optional[str]]]:
                 phone = normalize_br(href.replace("tel:", "")) or normalize_br(text)
                 if not phone:
                     continue
-                name = await _closest_name_for(page, a)
+                name = primary or await _closest_name_for(page, a)
                 if phone not in leads:
-                    leads[phone] = {"phone": phone, "name": name or None}
+                    leads[phone] = {"phone": phone, "name": (name or None)}
             except Exception:
                 continue
 
-        # Pass 2: Scan known result containers
+        # Passo 2: Varre blocos de resultados
         for sel in RESULT_CONTAINERS:
             try:
                 blocks = await page.query_selector_all(sel)
@@ -304,10 +365,12 @@ async def _extract_phones_from_page(page) -> List[Dict[str, Optional[str]]]:
                         txt = ""
                     if not txt:
                         continue
+
                     extracted = extract_phones_from_text(txt)
                     if not extracted:
                         continue
-                    # Attempt to find a name inside this block
+
+                    # Tenta achar um nome dentro do bloco; senão usa o 'primary'
                     try:
                         name_in_block = await page.evaluate(
                             f"""(el) => {{
@@ -319,19 +382,29 @@ async def _extract_phones_from_page(page) -> List[Dict[str, Optional[str]]]:
                                        if (t) return t;
                                    }}
                                 }}
+                                // fallback: aria-label do link para a ficha
+                                const a = el.querySelector('a[href*="/maps/place"],a[href*="/local/place"]');
+                                if (a) {{
+                                    const al = (a.getAttribute('aria-label') || a.textContent || '').trim();
+                                    if (al) return al;
+                                }}
                                 return null;
                             }}""",
                             block,
                         )
                     except Exception:
                         name_in_block = None
+
+                    if not name_in_block and primary:
+                        name_in_block = primary
+
                     for ph in extracted:
                         if ph not in leads:
-                            leads[ph] = {"phone": ph, "name": name_in_block or leads.get(ph, {}).get("name")}
+                            leads[ph] = {"phone": ph, "name": (name_in_block or None)}
             except Exception:
                 continue
 
-        # Pass 3: Fallback to scanning the entire page if no leads found
+        # Passo 3: Fallback geral no corpo
         if not leads:
             try:
                 body_text = await page.evaluate(
@@ -341,7 +414,7 @@ async def _extract_phones_from_page(page) -> List[Dict[str, Optional[str]]]:
                 body_text = ""
             for ph in extract_phones_from_text(body_text or ""):
                 if ph not in leads:
-                    leads[ph] = {"phone": ph, "name": None}
+                    leads[ph] = {"phone": ph, "name": (primary or None)}
 
     except Exception:
         pass
@@ -503,12 +576,16 @@ async def _open_and_extract_from_listing(
     page2 = await context.new_page()
     try:
         await _safe_goto(page2, href, wait_until="domcontentloaded", timeout=30000)
-        # Attempt to reveal phone numbers by clicking 'Telefone', 'Ligar', etc.
+        # Nome exato do card (ficha)
+        primary_name = await _primary_business_name(page2)
+
+        # Tentar revelar telefones antes de varrer
         for sel in [
             "button:has-text('Telefone')",
             "button:has-text('Ligar')",
             "a[aria-label^='Ligar']",
             "[aria-label*='Telefone']",
+            "button:has-text('Contato')",
         ]:
             try:
                 loc = page2.locator(sel)
@@ -517,8 +594,9 @@ async def _open_and_extract_from_listing(
                     await page2.wait_for_timeout(350)
             except Exception:
                 pass
-        await page2.wait_for_timeout(1000)
-        leads = await _extract_phones_from_page(page2)
+
+        await page2.wait_for_timeout(800)
+        leads = await _extract_phones_from_page(page2, default_name=primary_name)
         for lead in leads:
             ph = lead.get("phone")
             if ph and ph not in seen:
@@ -660,7 +738,49 @@ async def search_numbers(
 
                         leads = await _extract_phones_from_page(page)
 
-                        # If no leads found on the SERP, open listings concurrently
+                        # Se encontramos números mas MUITOS sem nome, abra fichas para enriquecer (nome exato)
+                        if leads:
+                            missing = [l for l in leads if not (l or {}).get("name")]
+                            if len(missing) >= max(1, len(leads) // 2):
+                                try:
+                                    cards = page.locator(",".join(LISTING_LINK_SELECTORS))
+                                    count = await cards.count()
+                                    to_open = min(count, 12)
+                                    max_conc = max(1, int(getattr(settings, "LISTING_CONCURRENCY", 3)))
+                                    tasks: List[asyncio.Task] = []
+                                    enriched: List[Dict[str, Optional[str]]] = []
+                                    for i in range(to_open):
+                                        try:
+                                            href = await cards.nth(i).get_attribute("href")
+                                        except (PWError, Exception):
+                                            href = None
+                                        tasks.append(asyncio.create_task(_open_and_extract_from_listing(context, href, seen)))
+                                        if len(tasks) >= max_conc:
+                                            results = await asyncio.gather(*tasks, return_exceptions=True)
+                                            tasks.clear()
+                                            for res in results:
+                                                if isinstance(res, Exception):
+                                                    continue
+                                                enriched.extend(res)
+                                    if tasks:
+                                        results = await asyncio.gather(*tasks, return_exceptions=True)
+                                        tasks.clear()
+                                        for res in results:
+                                            if isinstance(res, Exception):
+                                                continue
+                                            enriched.extend(res)
+                                    # Mapeia telefone->nome e injeta nos leads sem nome
+                                    name_map = {e["phone"]: e.get("name") for e in enriched if e.get("phone") and e.get("name")}
+                                    for l in leads:
+                                        if not l.get("name"):
+                                            nm = name_map.get(l["phone"])
+                                            if nm:
+                                                l["name"] = nm
+
+                                except (PWError, Exception):
+                                    pass
+
+                        # Se não achou leads na SERP, abra fichas (lógica existente)
                         if not leads:
                             try:
                                 cards = page.locator(",".join(LISTING_LINK_SELECTORS))
@@ -723,9 +843,7 @@ async def search_numbers(
                                 seen.add(ph)
                                 new += 1
                                 total_yield += 1
-                                log.debug(
-                                    f"New lead: {nm or '(sem nome)'} — {ph}"
-                                )
+                                log.debug(f"New lead: {nm or '(sem nome)'} — {ph}")
                                 yield {"phone": ph, "name": nm}
                                 if target and total_yield >= target:
                                     log.info(
