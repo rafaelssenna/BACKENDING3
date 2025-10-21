@@ -51,6 +51,16 @@ SEARCH_FMT = (
     "https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={query}&start={start}{uule}"
 )
 
+# A secondary search format that falls back to the generic Google search
+# without the local ("tbm=lcl") restriction.  This is used when local
+# searches return few or no leads for a given niche/city combination.
+# Note: the `uule` parameter is not appended for general searches as it
+# appears to have no effect outside of local results.  See
+# docs from Google for more information.
+SEARCH_FMT_GENERAL = (
+    "https://www.google.com/search?hl=pt-BR&gl=BR&q={query}&start={start}"
+)
+
 # CSS selectors for high‑level result containers on Google local search
 RESULT_CONTAINERS = [
     ".rlfl__tls",
@@ -668,6 +678,7 @@ async def search_numbers(
 
     try:
         total_yield = 0
+        # Outer loop over provided cities
         for local in locais:
             city = (local or "").strip()
             if not city:
@@ -682,16 +693,22 @@ async def search_numbers(
                     if t and t not in terms:
                         terms.append(t)
 
+            # Iterate over each variant of the search term
             for term in terms:
                 empty_pages = 0
                 idx = 0
                 captcha_hits_term = 0
+                # Track whether we've switched to the generic Google search
+                use_local = True
+                # Count how many leads we have produced for this term (across both
+                # local and general searches) to decide whether to fallback
+                generated_this_term = 0
 
                 # Log each search term for clarity. Terms include variations of the niche and city.
                 log.info(f"Searching term '{term}' in city '{city}'")
 
                 while True:
-                    # Respect the target limit
+                    # Respect the overall target across all terms and cities
                     if target and total_yield >= target:
                         return
                     # Optionally stop after a number of pages to avoid infinite loops
@@ -705,9 +722,16 @@ async def search_numbers(
                         decorations = ["", " ", "  ", " ★", " ✔", " ✓"]
                         q = (term + random.choice(decorations)).strip()
 
-                    url = SEARCH_FMT.format(
-                        query=urllib.parse.quote_plus(q), start=start, uule=uule
-                    )
+                    # Choose appropriate search URL. For local searches we append the uule
+                    # parameter; for generic searches we omit it entirely.
+                    if use_local:
+                        url = SEARCH_FMT.format(
+                            query=urllib.parse.quote_plus(q), start=start, uule=uule
+                        )
+                    else:
+                        url = SEARCH_FMT_GENERAL.format(
+                            query=urllib.parse.quote_plus(q), start=start
+                        )
 
                     # Create a new page for each request
                     page = await context.new_page()
@@ -719,6 +743,7 @@ async def search_numbers(
                                 page, url, wait_until="domcontentloaded", timeout=30000
                             )
                         except (PWError, CancelledError):
+                            # If navigation failed, close and retry once on a new page
                             try:
                                 await page.close()
                             except Exception:
@@ -732,6 +757,7 @@ async def search_numbers(
                         await _try_accept_consent(page)
                         await _humanize(page)
 
+                        # Check for CAPTCHA or unusual traffic pages
                         if await _is_captcha_or_sorry(page):
                             captcha_hits_term += 1
                             captcha_hits_global += 1
@@ -757,14 +783,20 @@ async def search_numbers(
 
                         leads = await _extract_phones_from_page(page)
 
-                        # Se encontramos números mas MUITOS sem nome, abra fichas para enriquecer (nome exato)
+                        # If we found numbers but many lack a name, open listings to enrich names.
                         if leads:
                             missing = [l for l in leads if not (l or {}).get("name")]
-                            if len(missing) >= max(1, len(leads) // 2):
+                            # Always attempt enrichment when there are missing names.  Open enough
+                            # listing cards to cover the missing entries (at least 12 to improve
+                            # coverage).  This increases reliability of name extraction while
+                            # preserving performance by limiting the maximum number of pages opened.
+                            if missing:
                                 try:
                                     cards = page.locator(",".join(LISTING_LINK_SELECTORS))
                                     count = await cards.count()
-                                    to_open = min(count, 12)
+                                    # Determine how many listings to open.  Ensure we open at least
+                                    # as many as the number of missing names and never fewer than 12.
+                                    to_open = min(count, max(12, len(missing)))
                                     max_conc = max(1, int(getattr(settings, "LISTING_CONCURRENCY", 3)))
                                     tasks: List[asyncio.Task] = []
                                     enriched: List[Dict[str, Optional[str]]] = []
@@ -781,6 +813,7 @@ async def search_numbers(
                                                 if isinstance(res, Exception):
                                                     continue
                                                 enriched.extend(res)
+                                    # Flush any remaining tasks
                                     if tasks:
                                         results = await asyncio.gather(*tasks, return_exceptions=True)
                                         tasks.clear()
@@ -788,41 +821,35 @@ async def search_numbers(
                                             if isinstance(res, Exception):
                                                 continue
                                             enriched.extend(res)
-                                    # Mapeia telefone->nome e injeta nos leads sem nome
+                                    # Map phone->name and inject into leads without names
                                     name_map = {e["phone"]: e.get("name") for e in enriched if e.get("phone") and e.get("name")}
                                     for l in leads:
                                         if not l.get("name"):
                                             nm = name_map.get(l["phone"])
                                             if nm:
                                                 l["name"] = nm
-
                                 except (PWError, Exception):
                                     pass
 
-                        # Se não achou leads na SERP, abra fichas (lógica existente)
+                        # If we didn't find any leads on this SERP page, open listing cards directly
                         if not leads:
                             try:
                                 cards = page.locator(",".join(LISTING_LINK_SELECTORS))
                                 count = await cards.count()
-                                # Limit the total number of listings to inspect
-                                to_open = min(count, 12)
-                                # Concurrency limit from settings
-                                max_conc = max(
-                                    1, int(getattr(settings, "LISTING_CONCURRENCY", 3))
-                                )
+                                # Increase the number of listings to inspect slightly to improve yield
+                                to_open = min(count, 15)
+                                max_conc = max(1, int(getattr(settings, "LISTING_CONCURRENCY", 3)))
                                 tasks: List[asyncio.Task] = []
                                 for i in range(to_open):
                                     try:
                                         href = await cards.nth(i).get_attribute("href")
                                     except (PWError, Exception):
                                         href = None
-                                    # schedule listing extraction
                                     tasks.append(
                                         asyncio.create_task(
                                             _open_and_extract_from_listing(context, href, seen)
                                         )
                                     )
-                                    # if we reached concurrency limit, flush tasks
                                     if len(tasks) >= max_conc:
                                         results = await asyncio.gather(
                                             *tasks, return_exceptions=True
@@ -832,13 +859,12 @@ async def search_numbers(
                                             if isinstance(res, Exception):
                                                 continue
                                             leads.extend(res)
-                                            if len(leads) >= 20:
+                                            # Break early if we've collected a reasonable number of leads
+                                            if len(leads) >= 25:
                                                 break
-                                    # check again after flush
-                                    if len(leads) >= 20:
+                                    if len(leads) >= 25:
                                         break
-                                # flush any remaining tasks
-                                if tasks and len(leads) < 20:
+                                if tasks and len(leads) < 25:
                                     results = await asyncio.gather(
                                         *tasks, return_exceptions=True
                                     )
@@ -847,7 +873,7 @@ async def search_numbers(
                                         if isinstance(res, Exception):
                                             continue
                                         leads.extend(res)
-                                        if len(leads) >= 20:
+                                        if len(leads) >= 25:
                                             break
                             except (PWError, Exception):
                                 pass
@@ -862,6 +888,7 @@ async def search_numbers(
                                 seen.add(ph)
                                 new += 1
                                 total_yield += 1
+                                generated_this_term += 1
                                 log.debug(f"New lead: {nm or '(sem nome)'} — {ph}")
                                 yield {"phone": ph, "name": nm}
                                 if target and total_yield >= target:
@@ -874,8 +901,24 @@ async def search_numbers(
                                         pass
                                     return
 
+                        # Update empty page counter. If no new leads, increment; otherwise reset.
                         empty_pages = empty_pages + 1 if new == 0 else 0
+
+                        # If we've exhausted a number of pages without new leads, decide whether
+                        # to fallback to general search or move to the next term.
                         if empty_pages >= empty_limit:
+                            # If still using local search and we have produced very few leads
+                            # for this term, fall back to general search and reset counters.
+                            if use_local and generated_this_term < 3:
+                                log.info(
+                                    f"Few or no leads found for term '{term}' in local search. Falling back to general search."
+                                )
+                                use_local = False
+                                empty_pages = 0
+                                idx = 0
+                                captcha_hits_term = 0
+                                continue
+                            # Otherwise break out to the next term.
                             log.info(
                                 f"Reached empty page limit ({empty_limit}) for term '{term}'. Moving to next term."
                             )
@@ -885,6 +928,7 @@ async def search_numbers(
                                 pass
                             break
 
+                        # Compute wait time between requests to mimic human behaviour and reduce detection
                         wait_ms = random.randint(320, 620) + min(
                             1800, int(idx * 48 + random.randint(140, 300))
                         )
@@ -892,6 +936,8 @@ async def search_numbers(
                         idx += 1
 
                     except (PWError, CancelledError, Exception):
+                        # Catch and handle any Playwright or other errors.  Close the page and
+                        # proceed to the next index.
                         try:
                             await page.close()
                         except Exception:
