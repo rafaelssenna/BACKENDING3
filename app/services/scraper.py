@@ -16,11 +16,24 @@ import base64
 import unicodedata
 from typing import AsyncGenerator, List, Set, Optional, Dict, Tuple, Any
 
-from playwright.async_api import (
-    async_playwright,
-    TimeoutError as PWTimeoutError,
-    Error as PWError,
-)
+try:
+    # Import Playwright lazily.  In some environments Playwright may
+    # not be installed (e.g. during unit tests or limited runtimes).
+    from playwright.async_api import (
+        async_playwright,
+        TimeoutError as PWTimeoutError,
+        Error as PWError,
+    )
+except ImportError:  # pragma: no cover -- allow import when Playwright missing
+    async_playwright = None  # type: ignore
+    # Define dummy exceptions to satisfy references in the code.  All
+    # Playwright interactions will raise ImportError at runtime if
+    # async_playwright is None.
+    class _DummyPlaywrightError(Exception):
+        pass
+
+    PWTimeoutError = _DummyPlaywrightError  # type: ignore
+    PWError = _DummyPlaywrightError  # type: ignore
 
 from ..config import settings
 from ..utils.phone import extract_phones_from_text, normalize_br
@@ -490,6 +503,12 @@ async def _ensure_browser():
         The running Playwright browser instance.
     """
     global _pw, _browser
+    # Ensure Playwright is available before attempting to start a browser.
+    if async_playwright is None:
+        raise ImportError(
+            "Playwright is not installed. Install the 'playwright' package to use the scraper."
+        )
+
     async with _pw_lock:
         if _pw is None:
             log.info("Starting Playwright…")
