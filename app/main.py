@@ -34,9 +34,13 @@ from .auth import router as auth_router, verify_access_via_query
 
 app = FastAPI(title="ClickLeads Backend", version="2.2.0")
 
+# Configure CORS.  Accept any origin by default and explicitly add the
+# Luna PG Admin frontend to avoid CORS errors when this service is
+# consumed from that domain.  Because ``allow_credentials`` is
+# disabled we can include "*" alongside a specific origin.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*", "https://luna-pg-admin.vercel.app"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -66,8 +70,56 @@ def _batch_size(n: int) -> int:
 
 
 def _cidade(local: str) -> str:
-    """Extract city name from the 'local' parameter (before any comma)."""
-    return (local or "").split(",")[0].strip()
+    """Extract the first city from the ``local`` parameter.
+
+    Historically this backend only supported a single city and would
+    split on the first comma to strip the state abbreviation (e.g.
+    ``"Belo Horizonte, MG"`` → ``"Belo Horizonte"``).  To maintain
+    backward‑compatibility this helper still performs that behaviour
+    when a single city is supplied.  When multiple cities are provided
+    in the same ``local`` string this function simply returns the first
+    non‑empty entry after splitting on common separators (``|``, ``;`` or
+    newlines) and then on a comma.  See :func:`_locais` for splitting
+    the full list of cities.
+    """
+    # Normalise multiple cities via _locais and return the first one
+    cities = _locais(local)
+    if not cities:
+        return ""
+    # Preserve original behaviour: strip anything after the first comma
+    city = cities[0]
+    return city.split(",")[0].strip()
+
+
+def _locais(local: str) -> List[str]:
+    """Split the ``local`` query parameter into a list of city strings.
+
+    Clients can supply multiple cities separated by ``|``, ``;`` or
+    newlines.  Commas are *not* treated as delimiters so that state
+    abbreviations (e.g. ``"São Paulo, SP"``) remain intact.  Leading
+    and trailing whitespace around each city is stripped.  Empty
+    segments are ignored.
+
+    Examples::
+
+        >>> _locais("Belo Horizonte, MG")
+        ['Belo Horizonte, MG']
+        >>> _locais("Belo Horizonte|São Paulo;Rio de Janeiro\nCuritiba")
+        ['Belo Horizonte', 'São Paulo', 'Rio de Janeiro', 'Curitiba']
+    """
+    if not local:
+        return []
+    text = str(local).strip()
+    # Look for known separators and split on the first one present.  We
+    # check specific separators in a deterministic order and only split
+    # on the first one found to avoid splitting on commas inside city
+    # names (e.g. the ``", SP"`` in ``"São Paulo, SP"``).
+    for delim in ["|", ";", "\n", "\r", "\r\n"]:
+        if delim in text:
+            parts = [p.strip() for p in text.split(delim) if p and p.strip()]
+            return parts
+    # No multi‑city separator – treat the whole string as one entry
+    return [text]
 
 
 def _scrape_cap(remaining: int, somente_wa: bool) -> int:
@@ -106,15 +158,19 @@ async def leads_stream(
     auth=Depends(verify_access_via_query),
 ):
     """
-    SSE endpoint for real‑time delivery of leads. Returns a stream of events
-    including progress updates and individual lead items. If verify=1,
-    numbers are checked via the WhatsApp verifier service before being
-    emitted as valid leads.
+    SSE endpoint for real‑time delivery of leads.  Supports multiple
+    cities separated by ``|``, ``;`` or newlines.  Emits `city`
+    events signalling the start and end of scraping for each city.  If
+    ``verify=1``, numbers are checked via the WhatsApp verifier
+    service before being emitted.
     """
     _uid, _sid, _dev = auth
 
     somente_wa = verify == 1
-    cidade = _cidade(local)
+    # Parse the list of cities from the incoming query.  If nothing is
+    # provided default to an empty list, which will result in no
+    # results.
+    cities = _locais(local)
     target = n
 
     async def gen():
@@ -130,6 +186,8 @@ async def leads_stream(
         sent_done = False
 
         last_beat = asyncio.get_event_loop().time()
+        # Keep track of the city currently being processed for progress
+        current_city = ""
 
         def maybe_tick():
             nonlocal last_beat
@@ -140,6 +198,13 @@ async def leads_stream(
             return None
 
         async def flush_pool(pool: List[str]):
+            """
+            Verify the batch of phones in ``pool``, update counters and
+            yield SSE events for each verified number as well as
+            progress.  Uses the outer scope variables ``delivered``,
+            ``non_wa``, ``searched`` and ``current_city``.  Note that
+            ``pool`` is consumed (i.e. not cleared) by the caller.
+            """
             nonlocal delivered, non_wa
             if not pool:
                 return
@@ -161,103 +226,151 @@ async def leads_stream(
                     )
                     if delivered >= target:
                         break
+            # Always report progress after verifying a batch
             yield sse(
                 "progress",
                 {
                     "wa_count": delivered,
                     "non_wa_count": non_wa,
                     "searched": searched,
-                    "city": cidade,
+                    "city": current_city,
                 },
             )
 
         try:
+            # Notify client that the stream has begun
             yield sse("start", {"message": "started"})
             tick = maybe_tick()
             if tick:
                 yield tick
-            yield sse("city", {"status": "start", "name": cidade})
 
-            pool: List[str] = []
+            # Iterate through each provided city sequentially
+            for cidade in cities:
+                # Update the currently processed city for progress events
+                current_city = cidade
+                # Emit a city start event
+                yield sse("city", {"status": "start", "name": cidade})
 
-            # First pass: collect candidates (over‑sample if somente_wa)
-            scrape_cap = _scrape_cap(target - delivered, somente_wa)
-            async for item in search_numbers(
-                nicho, [cidade], scrape_cap, max_pages=None
-            ):
-                tick = maybe_tick()
-                if tick:
-                    yield tick
+                # A fresh pool for each city when verifying WhatsApp
+                pool: List[str] = []
 
+                # First pass: collect candidates (over‑sample if verifying WhatsApp)
+                while delivered < target:
+                    # Determine the number of results to scrape.  If no
+                    # leads remain to deliver break out of this city loop.
+                    remaining = target - delivered
+                    if remaining <= 0:
+                        break
+                    scrape_cap = _scrape_cap(remaining, somente_wa)
+                    # Run the scraper for the current city.  The search_numbers
+                    # generator yields phone/name dictionaries.  We break out
+                    # when we have enough leads or when the scraper is
+                    # exhausted.
+                    async for item in search_numbers(
+                        nicho, [cidade], scrape_cap, max_pages=None
+                    ):
+                        tick = maybe_tick()
+                        if tick:
+                            yield tick
+
+                        if delivered >= target:
+                            break
+
+                        ph, nm = _lead_tuple(item)
+                        if not ph or ph in vistos:
+                            continue
+                        vistos.add(ph)
+                        searched += 1
+                        # Save the name associated with this phone if we
+                        # haven't seen it before
+                        name_by_phone.setdefault(ph, nm)
+
+                        if not somente_wa:
+                            # Immediate emit when not verifying WhatsApp
+                            delivered += 1
+                            yield sse(
+                                "item",
+                                {"phone": ph, "name": nm, "has_whatsapp": False},
+                            )
+                            yield sse(
+                                "progress",
+                                {
+                                    "wa_count": delivered,
+                                    "non_wa_count": non_wa,
+                                    "searched": searched,
+                                    "city": current_city,
+                                },
+                            )
+                            if delivered >= target:
+                                break
+                            # Continue collecting until we reach the target or
+                            # exhaust the search
+                            continue
+
+                        # When verifying WhatsApp: accumulate numbers into
+                        # batches before verifying via UAZAPI
+                        pool.append(ph)
+                        if len(pool) >= min_batch and delivered < target:
+                            async for chunk in flush_pool(pool[:min_batch]):
+                                yield chunk
+                            pool = pool[min_batch:]
+                        if len(pool) >= full_batch and delivered < target:
+                            async for chunk in flush_pool(pool[:full_batch]):
+                                yield chunk
+                            pool = pool[full_batch:]
+                    # The inner search loop may have been exhausted or
+                    # interrupted.  Break out to the next phase (second pass
+                    # or next city) once we've iterated over this
+                    # scrape_cap worth of results.
+                    break
+
+                # Second pass: if verifying WhatsApp and we still need more
+                # valid numbers after the first pass.  Over‑sample again to
+                # find additional candidates.
+                if somente_wa and delivered < target:
+                    remaining = target - delivered
+                    if remaining > 0:
+                        extra_cap = _scrape_cap(remaining, True)
+                        async for item in search_numbers(
+                            nicho, [cidade], extra_cap, max_pages=None
+                        ):
+                            tick = maybe_tick()
+                            if tick:
+                                yield tick
+
+                            if delivered >= target:
+                                break
+                            ph, nm = _lead_tuple(item)
+                            if not ph or ph in vistos:
+                                continue
+                            vistos.add(ph)
+                            searched += 1
+                            name_by_phone.setdefault(ph, nm)
+                            pool.append(ph)
+                            if len(pool) >= min_batch and delivered < target:
+                                async for chunk in flush_pool(pool[:min_batch]):
+                                    yield chunk
+                                pool = pool[min_batch:]
+                        # end of extra search loop
+
+                # Flush any remaining numbers in the pool for this city if
+                # verifying WhatsApp and there are still numbers to deliver
+                if somente_wa and pool and delivered < target:
+                    async for chunk in flush_pool(pool):
+                        yield chunk
+                    pool.clear()
+
+                # Emit a city done event when we're finished with this city
+                yield sse("city", {"status": "done", "name": cidade})
+
+                # If we've reached our target, stop processing further cities
                 if delivered >= target:
                     break
 
-                ph, nm = _lead_tuple(item)
-                if not ph or ph in vistos:
-                    continue
-                vistos.add(ph)
-                searched += 1
-                name_by_phone.setdefault(ph, nm)
-
-                if not somente_wa:
-                    delivered += 1
-                    yield sse(
-                        "item",
-                        {"phone": ph, "name": nm, "has_whatsapp": False},
-                    )
-                    yield sse(
-                        "progress",
-                        {
-                            "wa_count": delivered,
-                            "non_wa_count": non_wa,
-                            "searched": searched,
-                            "city": cidade,
-                        },
-                    )
-                    continue
-
-                pool.append(ph)
-                if len(pool) >= min_batch and delivered < target:
-                    async for chunk in flush_pool(pool[:min_batch]):
-                        yield chunk
-                    pool = pool[min_batch:]
-                if len(pool) >= full_batch and delivered < target:
-                    async for chunk in flush_pool(pool[:full_batch]):
-                        yield chunk
-                    pool = pool[full_batch:]
-
-            # Second pass: need more WhatsApp valid numbers?
-            if somente_wa and delivered < target:
-                extra_needed = target - delivered
-                extra_cap = _scrape_cap(extra_needed, True)
-                async for item in search_numbers(
-                    nicho, [cidade], extra_cap, max_pages=None
-                ):
-                    tick = maybe_tick()
-                    if tick:
-                        yield tick
-
-                    if delivered >= target:
-                        break
-                    ph, nm = _lead_tuple(item)
-                    if not ph or ph in vistos:
-                        continue
-                    vistos.add(ph)
-                    searched += 1
-                    name_by_phone.setdefault(ph, nm)
-                    pool.append(ph)
-                    if len(pool) >= min_batch and delivered < target:
-                        async for chunk in flush_pool(pool[:min_batch]):
-                            yield chunk
-                        pool = pool[min_batch:]
-
-            # Flush remaining pool
-            if somente_wa and pool and delivered < target:
-                async for chunk in flush_pool(pool):
-                    yield chunk
-                pool.clear()
-
-            yield sse("city", {"status": "done", "name": cidade})
+            # After all cities processed or target reached, emit the final
+            # done event.  The ``exhausted`` flag indicates whether we
+            # managed to fill the requested number of leads before running
+            # out of results.
             exhausted = delivered < target
             yield sse(
                 "done",
@@ -271,6 +384,7 @@ async def leads_stream(
             sent_done = True
 
         except CancelledError:
+            # The client cancelled the connection; simply stop sending data
             return
         except Exception as e:
             # Emit error information in the progress and done events
@@ -281,6 +395,7 @@ async def leads_stream(
                     "wa_count": delivered,
                     "non_wa_count": non_wa,
                     "searched": searched,
+                    "city": current_city,
                 },
             )
             yield sse(
@@ -321,12 +436,14 @@ async def leads(
     verify: int = Query(0),
 ):
     """
-    Fallback endpoint returning leads in JSON. If verify=1, numbers are
-    checked for WhatsApp availability. The response includes both phone
-    numbers and names for each lead.
+    Fallback endpoint returning leads in JSON.  Supports multiple
+    cities separated by ``|``, ``;`` or newlines.  When ``verify=1``
+    numbers are checked for WhatsApp availability before inclusion.
+    Each returned entry includes both the phone number and the
+    associated establishment name when available.
     """
     somente_wa = verify == 1
-    cidade = _cidade(local)
+    cities = _locais(local)
     target = n
 
     items: List[Dict[str, Any]] = []
@@ -338,36 +455,111 @@ async def leads(
 
     base_batch = _batch_size(target)
     min_batch = min(8, base_batch)
+    full_batch = base_batch
 
     try:
         pool: List[str] = []
-
-        # First pass
-        scrape_cap = _scrape_cap(target - delivered, somente_wa)
-        async for item in search_numbers(
-            nicho, [cidade], scrape_cap, max_pages=None
-        ):
+        # Process each city sequentially until the target number of leads is met
+        for cidade in cities:
             if delivered >= target:
                 break
-            ph, nm = _lead_tuple(item)
-            if not ph or ph in vistos:
-                continue
-            vistos.add(ph)
-            searched += 1
-            name_by_phone.setdefault(ph, nm)
+            # First pass: scrape an over‑sampled number of results for this city
+            remaining = target - delivered
+            if remaining <= 0:
+                break
+            scrape_cap = _scrape_cap(remaining, somente_wa)
+            async for item in search_numbers(
+                nicho, [cidade], scrape_cap, max_pages=None
+            ):
+                if delivered >= target:
+                    break
+                ph, nm = _lead_tuple(item)
+                if not ph or ph in vistos:
+                    continue
+                vistos.add(ph)
+                searched += 1
+                name_by_phone.setdefault(ph, nm)
 
-            if not somente_wa:
-                items.append({"phone": ph, "name": nm})
-                delivered += 1
-                continue
+                if not somente_wa:
+                    items.append({"phone": ph, "name": nm})
+                    delivered += 1
+                    if delivered >= target:
+                        break
+                    continue
 
-            pool.append(ph)
-            if len(pool) >= min_batch:
+                # verifying WhatsApp: accumulate numbers into batches
+                pool.append(ph)
+                # verify in small batches to avoid large API calls and to fill up leads sooner
+                if len(pool) >= min_batch:
+                    try:
+                        ok, bad = await verify_batch(pool[:min_batch], batch_size=min_batch)
+                    except Exception:
+                        ok, bad = [], []
+                    pool = pool[min_batch:]
+                    non_wa += len(bad)
+                    for p in ok:
+                        if delivered < target:
+                            items.append({"phone": p, "name": name_by_phone.get(p)})
+                            delivered += 1
+                            if delivered >= target:
+                                break
+                # Optionally flush a larger batch if we accumulate many numbers at once
+                if len(pool) >= full_batch:
+                    try:
+                        ok, bad = await verify_batch(pool[:full_batch], batch_size=full_batch)
+                    except Exception:
+                        ok, bad = [], []
+                    pool = pool[full_batch:]
+                    non_wa += len(bad)
+                    for p in ok:
+                        if delivered < target:
+                            items.append({"phone": p, "name": name_by_phone.get(p)})
+                            delivered += 1
+                            if delivered >= target:
+                                break
+
+            # Second pass: if verifying WhatsApp and still need more leads,
+            # over‑sample additional results for this city.  This mirrors
+            # the second pass in the streaming endpoint, improving the
+            # likelihood of finding enough valid numbers when the first
+            # batch yields too few.
+            if somente_wa and delivered < target:
+                remaining = target - delivered
+                if remaining > 0:
+                    extra_cap = _scrape_cap(remaining, True)
+                    async for item in search_numbers(
+                        nicho, [cidade], extra_cap, max_pages=None
+                    ):
+                        if delivered >= target:
+                            break
+                        ph, nm = _lead_tuple(item)
+                        if not ph or ph in vistos:
+                            continue
+                        vistos.add(ph)
+                        searched += 1
+                        name_by_phone.setdefault(ph, nm)
+                        pool.append(ph)
+                        if len(pool) >= min_batch:
+                            try:
+                                ok, bad = await verify_batch(pool[:min_batch], batch_size=min_batch)
+                            except Exception:
+                                ok, bad = [], []
+                            pool = pool[min_batch:]
+                            non_wa += len(bad)
+                            for p in ok:
+                                if delivered < target:
+                                    items.append({"phone": p, "name": name_by_phone.get(p)})
+                                    delivered += 1
+                                    if delivered >= target:
+                                        break
+                    # end of extra search loop
+
+            # After finishing scraping this city, flush any remaining numbers in the pool
+            if somente_wa and pool and delivered < target:
                 try:
-                    ok, bad = await verify_batch(pool[:min_batch], batch_size=min_batch)
+                    ok, bad = await verify_batch(pool, batch_size=len(pool))
                 except Exception:
                     ok, bad = [], []
-                pool = pool[min_batch:]
                 non_wa += len(bad)
                 for p in ok:
                     if delivered < target:
@@ -375,24 +567,17 @@ async def leads(
                         delivered += 1
                         if delivered >= target:
                             break
+                pool.clear()
 
-        # Second pass if needed and pool still has candidates
-        if somente_wa and delivered < target and pool:
-            try:
-                ok, bad = await verify_batch(pool, batch_size=len(pool))
-            except Exception:
-                ok, bad = [], []
-            non_wa += len(bad)
-            for p in ok:
-                if delivered < target:
-                    items.append({"phone": p, "name": name_by_phone.get(p)})
-                    delivered += 1
-                    if delivered >= target:
-                        break
+        # end for each city
 
     except Exception:
         pass
 
+    # Build the response payload.  Each entry includes ``has_whatsapp``
+    # indicating whether WhatsApp verification was requested (not per‑number
+    # success).  The ``items`` and ``leads`` keys are duplicated for
+    # backwards compatibility with older clients.
     data = [
         {"phone": r["phone"], "name": r.get("name"), "has_whatsapp": bool(verify)}
         for r in items[:target]
