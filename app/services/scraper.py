@@ -854,11 +854,12 @@ async def search_numbers(
                                 try:
                                     cards = page.locator(",".join(LISTING_LINK_SELECTORS))
                                     count = await cards.count()
-                                    # Abrir no máximo tantos cards quanto o número de leads que
-                                    # necessitam de enriquecimento (entradas em ``missing``).  Isso
-                                    # evita abrir mais fichas do que o necessário para obter
-                                    # nomes ausentes ou repetidos.
-                                    to_open = min(count, len(missing))
+                                    # Definimos um limite máximo de fichas a abrir para
+                                    # enriquecimento. Abrir muitas fichas em sequência pode
+                                    # ser lento e aumentar a probabilidade de CAPTCHA. Ajuste
+                                    # este valor conforme a necessidade (padrão: 20).
+                                    MAX_ENRICH_CARDS = 20
+                                    to_open = min(count, MAX_ENRICH_CARDS)
                                     enriched: List[Dict[str, Optional[str]]] = []
                                     for i in range(to_open):
                                         try:
@@ -866,29 +867,25 @@ async def search_numbers(
                                         except (PWError, Exception):
                                             href = None
                                         try:
-                                            # Use a fresh ``seen`` (None) when enriching missing
-                                            # names so that previously seen numbers can still be
-                                            # retrieved to obtain their associated business
-                                            # names.  This avoids skipping phones whose names
-                                            # need updating simply because they have been seen
-                                            # earlier in the scraping session.
+                                            # Ao enriquecer nomes, não deduplicamos via ``seen`` global.
+                                            # Passar ``None`` permite re-extrair números já vistos para
+                                            # capturar corretamente o nome da empresa.
                                             res = await _open_and_extract_from_listing(context, href, None)
                                         except Exception:
                                             res = []
                                         if res:
                                             enriched.extend(res)
-                                        # Opcional: se já conseguimos nomes para todas as entradas "missing", podemos parar
-                                        if len({e.get("phone") for e in enriched}) >= len(missing):
-                                            # break early to reduce navigation
-                                            break
-                                    # Mapear phone->name e injetar nos leads
+                                            # Se já obtivemos nomes para todos os telefones com nome ausente,
+                                            # podemos parar para reduzir navegação.
+                                            if len({e.get("phone") for e in enriched}) >= len(missing):
+                                                break
+                                    # Associa os nomes extraídos aos telefones originais.
                                     name_map = {
                                         e["phone"]: e.get("name")
                                         for e in enriched
                                         if e.get("phone") and e.get("name")
                                     }
                                     for l in leads:
-                                        # Se o nome estiver ausente ou se todos eram repetidos, tente atualizar
                                         if not l.get("name") or (len(unique_names) <= 1):
                                             nm = name_map.get(l["phone"])
                                             if nm:
