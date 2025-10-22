@@ -610,25 +610,35 @@ async def _safe_goto(page, url: str, **kw):
 
 # ---------- abrir ficha ----------
 async def _open_and_extract_from_listing(
-    context, href: str, seen: Set[str]
+    context,
+    href: str,
+    seen: Optional[Set[str]] = None,
 ) -> List[Dict[str, Optional[str]]]:
     """
-    Open a business listing in a new page and extract phone/name pairs. The
-    function avoids visiting duplicate listings by checking the 'seen' set.
+    Open a business listing in a new page and extract phone/name pairs.
+
+    If ``seen`` is provided, numbers present in the set will be
+    excluded from the returned results and added to ``seen``. When
+    ``seen`` is ``None`` the function will return all numbers found
+    within the listing without filtering against previously seen
+    values. A per‑listing deduplication is always applied to avoid
+    returning the same phone multiple times from a single page.
     """
     out: List[Dict[str, Optional[str]]] = []
     if not href:
         return out
+    # Prepend host if relative path
     if href.startswith("/"):
         href = "https://www.google.com" + href
 
     page2 = await context.new_page()
     try:
+        # Navigate to the listing card
         await _safe_goto(page2, href, wait_until="domcontentloaded", timeout=30000)
-        # Nome exato do card (ficha)
+        # Attempt to extract the primary name of the business
         primary_name = await _primary_business_name(page2)
 
-        # Tentar revelar telefones antes de varrer
+        # Try clicking on buttons/links that reveal phone numbers
         for sel in [
             "button:has-text('Telefone')",
             "button:has-text('Ligar')",
@@ -644,14 +654,26 @@ async def _open_and_extract_from_listing(
             except Exception:
                 pass
 
+        # Give the page a moment to update after revealing numbers
         await page2.wait_for_timeout(800)
+        # Extract phones/names from the listing page
         leads = await _extract_phones_from_page(page2, default_name=primary_name)
+
+        # Local deduplication to avoid duplicate phones from the same page
+        added: Set[str] = set()
         for lead in leads:
             ph = lead.get("phone")
-            if ph and ph not in seen:
-                seen.add(ph)
+            if not ph or ph in added:
+                continue
+            added.add(ph)
+            # If a ``seen`` set was supplied, only include numbers not
+            # previously processed.  Otherwise return all numbers.
+            if seen is None or ph not in seen:
+                if seen is not None:
+                    seen.add(ph)
                 out.append(lead)
     except (PWError, CancelledError, Exception):
+        # Intentionally swallow exceptions to keep scraping robust
         pass
     finally:
         try:
@@ -832,8 +854,11 @@ async def search_numbers(
                                 try:
                                     cards = page.locator(",".join(LISTING_LINK_SELECTORS))
                                     count = await cards.count()
-                                    # Abrir no máximo tantos cards quanto o número de leads
-                                    to_open = min(count, len(leads))
+                                    # Abrir no máximo tantos cards quanto o número de leads que
+                                    # necessitam de enriquecimento (entradas em ``missing``).  Isso
+                                    # evita abrir mais fichas do que o necessário para obter
+                                    # nomes ausentes ou repetidos.
+                                    to_open = min(count, len(missing))
                                     enriched: List[Dict[str, Optional[str]]] = []
                                     for i in range(to_open):
                                         try:
@@ -841,7 +866,13 @@ async def search_numbers(
                                         except (PWError, Exception):
                                             href = None
                                         try:
-                                            res = await _open_and_extract_from_listing(context, href, seen)
+                                            # Use a fresh ``seen`` (None) when enriching missing
+                                            # names so that previously seen numbers can still be
+                                            # retrieved to obtain their associated business
+                                            # names.  This avoids skipping phones whose names
+                                            # need updating simply because they have been seen
+                                            # earlier in the scraping session.
+                                            res = await _open_and_extract_from_listing(context, href, None)
                                         except Exception:
                                             res = []
                                         if res:
@@ -878,6 +909,11 @@ async def search_numbers(
                                     except (PWError, Exception):
                                         href = None
                                     try:
+                                        # When no leads were found on the current SERP page we
+                                        # open listing cards sequentially to extract phone
+                                        # numbers.  Deduplication against the global ``seen`` set
+                                        # is desired here to avoid re‑emitting numbers that have
+                                        # already been collected elsewhere.
                                         res = await _open_and_extract_from_listing(context, href, seen)
                                     except Exception:
                                         res = []
