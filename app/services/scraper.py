@@ -359,8 +359,23 @@ async def _extract_phones_from_page(page, default_name: Optional[str] = None) ->
     """
     leads: Dict[str, Dict[str, Optional[str]]] = {}
     try:
-        # Se estivermos numa FICHA, este será o nome exato do card.
-        primary = default_name or await _primary_business_name(page)
+        # Determine whether we are on a listing (business details) page.  Only
+        # compute a primary business name when inside a Google Maps card
+        # (URL containing "/maps/place" or "/local/place").  On search
+        # result pages, avoid setting a fallback name to prevent all
+        # extracted numbers from inheriting the same business name.  When
+        # default_name is explicitly provided (e.g. when called from
+        # _open_and_extract_from_listing), honour it.
+        primary: Optional[str] = None
+        if default_name:
+            primary = default_name
+        else:
+            try:
+                url: str = page.url or ""
+            except Exception:
+                url = ""
+            if "/maps/place" in url or "/local/place" in url:
+                primary = await _primary_business_name(page)
 
         # Passo 1: <a href="tel:"> anchors e seu texto
         anchors = await page.query_selector_all("a[href^='tel:']")
@@ -393,7 +408,11 @@ async def _extract_phones_from_page(page, default_name: Optional[str] = None) ->
                     if not extracted:
                         continue
 
-                    # Tenta achar um nome dentro do bloco; senão usa o 'primary'
+                    # Tenta achar um nome dentro do bloco; se nada for
+                    # encontrado e estivermos em uma ficha (primary definido),
+                    # use-o como fallback.  Nas páginas de resultados
+                    # (primary é None), não atribua nenhum nome; isso evita
+                    # replicar o mesmo nome para múltiplos telefones.
                     try:
                         name_in_block = await page.evaluate(
                             f"""(el) => {{
@@ -418,6 +437,7 @@ async def _extract_phones_from_page(page, default_name: Optional[str] = None) ->
                     except Exception:
                         name_in_block = None
 
+                    # Se nada encontrado, só use o 'primary' se estiver definido
                     if not name_in_block and primary:
                         name_in_block = primary
 
@@ -783,19 +803,32 @@ async def search_numbers(
 
                         leads = await _extract_phones_from_page(page)
 
-                        # If we found numbers but many lack a name, open listings to enrich names.
+                        # Se encontramos números, verifique se os nomes
+                        # extraídos parecem confiáveis.  Se todos os nomes são
+                        # iguais ou se há entradas sem nome, trate todas essas
+                        # entradas como "missing" para forçar a abertura das
+                        # fichas e enriquecer corretamente.  Isso evita o
+                        # problema em que um nome de fallback (geralmente
+                        # proveniente de uma única ficha) é associado a todos
+                        # os números.
                         if leads:
-                            missing = [l for l in leads if not (l or {}).get("name")]
-                            # Always attempt enrichment when there are missing names.  Open enough
-                            # listing cards to cover the missing entries (at least 12 to improve
-                            # coverage).  This increases reliability of name extraction while
-                            # preserving performance by limiting the maximum number of pages opened.
+                            unique_names = set(
+                                (l.get("name") or "") for l in leads if l.get("name")
+                            )
+                            if len(unique_names) <= 1:
+                                missing = leads[:]
+                            else:
+                                missing = [l for l in leads if not (l or {}).get("name")]
+                            # Sempre tente enriquecimento quando houver nomes
+                            # ausentes ou suspeitos.  Abrimos cards suficientes
+                            # para cobrir todas as entradas consideradas
+                            # "missing" (mínimo de 12) para melhorar a
+                            # extração de nomes, ao mesmo tempo em que
+                            # limitamos o número de páginas abertas.
                             if missing:
                                 try:
                                     cards = page.locator(",".join(LISTING_LINK_SELECTORS))
                                     count = await cards.count()
-                                    # Determine how many listings to open.  Ensure we open at least
-                                    # as many as the number of missing names and never fewer than 12.
                                     to_open = min(count, max(12, len(missing)))
                                     max_conc = max(1, int(getattr(settings, "LISTING_CONCURRENCY", 3)))
                                     tasks: List[asyncio.Task] = []
@@ -805,9 +838,19 @@ async def search_numbers(
                                             href = await cards.nth(i).get_attribute("href")
                                         except (PWError, Exception):
                                             href = None
-                                        tasks.append(asyncio.create_task(_open_and_extract_from_listing(context, href, seen)))
+                                        # Cria a tarefa e adiciona à lista
+                                        tasks.append(
+                                            asyncio.create_task(
+                                                _open_and_extract_from_listing(
+                                                    context, href, seen
+                                                )
+                                            )
+                                        )
+                                        # Se atingimos a concorrência máxima, aguarde todas as tarefas
                                         if len(tasks) >= max_conc:
-                                            results = await asyncio.gather(*tasks, return_exceptions=True)
+                                            results = await asyncio.gather(
+                                                *tasks, return_exceptions=True
+                                            )
                                             tasks.clear()
                                             for res in results:
                                                 if isinstance(res, Exception):
@@ -815,16 +858,22 @@ async def search_numbers(
                                                 enriched.extend(res)
                                     # Flush any remaining tasks
                                     if tasks:
-                                        results = await asyncio.gather(*tasks, return_exceptions=True)
+                                        results = await asyncio.gather(
+                                            *tasks, return_exceptions=True
+                                        )
                                         tasks.clear()
                                         for res in results:
                                             if isinstance(res, Exception):
                                                 continue
                                             enriched.extend(res)
-                                    # Map phone->name and inject into leads without names
-                                    name_map = {e["phone"]: e.get("name") for e in enriched if e.get("phone") and e.get("name")}
+                                    # Mapear phone->name e injetar nos leads
+                                    name_map = {
+                                        e["phone"]: e.get("name")
+                                        for e in enriched
+                                        if e.get("phone") and e.get("name")
+                                    }
                                     for l in leads:
-                                        if not l.get("name"):
+                                        if not l.get("name") or (len(unique_names) <= 1):
                                             nm = name_map.get(l["phone"])
                                             if nm:
                                                 l["name"] = nm
