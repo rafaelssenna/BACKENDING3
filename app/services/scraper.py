@@ -820,7 +820,10 @@ async def search_numbers(
                                 "a[href^='tel:']," + ",".join(RESULT_CONTAINERS),
                                 timeout=8000,
                             )
-                        except PWTimeoutError:
+                        except (PWTimeoutError, PWError, CancelledError, Exception):
+                            # A página pode ser fechada antes da espera terminar, o que
+                            # lança TargetClosedError ou outras exceções.  Capturamos
+                            # genericamente e seguimos em frente.
                             pass
 
                         leads = await _extract_phones_from_page(page)
