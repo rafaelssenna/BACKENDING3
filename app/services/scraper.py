@@ -231,6 +231,39 @@ def _uule_for_city(city: str) -> str:
     return "&uule=" + urllib.parse.quote("w+CAIQICI" + b64, safe="")
 
 
+# ------------------------- helpers anti-erro/fechamento -------------------------
+
+def _page_alive(page) -> bool:
+    """Return True if page exists and is not closed."""
+    try:
+        return bool(page) and not page.is_closed()
+    except Exception:
+        return False
+
+
+async def _safe_wait_for_selector(
+    page,
+    selector: str,
+    *,
+    timeout: int = 8000,
+    state: str = "attached",
+) -> bool:
+    """
+    Wait for selector with guards against TargetClosedError and timeouts.
+    Returns True if the selector is observed (in the chosen state),
+    otherwise False without raising.
+    """
+    try:
+        if not _page_alive(page):
+            return False
+        await page.wait_for_selector(selector, timeout=timeout, state=state)
+        return True
+    except (PWTimeoutError, PWError, CancelledError, Exception):
+        return False
+
+
+# -------------------------------------------------------------------------------
+
 async def _try_accept_consent(page) -> None:
     """
     Attempt to click any visible consent buttons on the page. Ignores
@@ -238,6 +271,8 @@ async def _try_accept_consent(page) -> None:
     since consent dialogs vary by region and A/B test.
     """
     try:
+        if not _page_alive(page):
+            return
         for sel in CONSENT_BUTTONS:
             loc = page.locator(sel)
             if await loc.count() > 0 and await loc.first.is_visible():
@@ -255,6 +290,8 @@ async def _humanize(page) -> None:
     human behavior. Failures are ignored.
     """
     try:
+        if not _page_alive(page):
+            return
         await page.mouse.move(
             random.randint(40, 420), random.randint(60, 320), steps=random.randint(6, 14)
         )
@@ -271,6 +308,8 @@ async def _primary_business_name(page) -> Optional[str]:
     Return the main business name when on the listing detail page (Google Maps card).
     Prioritises the exact card title and safe fallbacks.
     """
+    if not _page_alive(page):
+        return None
     try:
         # meta[itemprop='name'] requires attribute access, handle separately
         meta = await page.locator("meta[itemprop='name']").count()
@@ -288,7 +327,7 @@ async def _primary_business_name(page) -> Optional[str]:
                     if t:
                         return t
 
-        # As a very last resort, try <title> and strip suffixes " - Google Maps"/" – Google Maps"
+        # As a very last resort, try <title> and strip suffixes
         title_loc = page.locator("title")
         if await title_loc.count() > 0:
             t = (await title_loc.first.text_content()) or ""
@@ -309,10 +348,9 @@ async def _closest_name_for(page, element) -> Optional[str]:
     matching NAME_CANDIDATES selectors. Returns the first non‑empty
     text found or None.
     """
+    if not _page_alive(page):
+        return None
     try:
-        # Evaluate in the page context: search upwards for a container and
-        # query candidate selectors within that container. If nothing found,
-        # try aria-label of the anchor to the listing.
         return await page.evaluate(
             f"""(el) => {{
                 let node = el.closest('.VkpGBb,.dbg0pd,[role="article"],.rllt__details,.rlfl__tls,#search,.kp-wholepage') || el.parentElement;
@@ -325,7 +363,6 @@ async def _closest_name_for(page, element) -> Optional[str]:
                       if (t) return t;
                     }}
                   }}
-                  // tenta via aria-label do link de card
                   const a = node.querySelector('a[href*="/maps/place"],a[href*="/local/place"]');
                   if (a) {{
                       const al = (a.getAttribute('aria-label') || a.textContent || '').trim();
@@ -343,29 +380,14 @@ async def _closest_name_for(page, element) -> Optional[str]:
 
 async def _extract_phones_from_page(page, default_name: Optional[str] = None) -> List[Dict[str, Optional[str]]]:
     """
-    Extract phone numbers and corresponding business names from the current
-    page. The return value is a list of dictionaries with 'phone' and
-    'name' keys. Phone numbers are normalized to include the country
-    prefix. Names may be None if no name could be determined.
-
-    The function performs extraction in multiple passes:
-    1. Clickable tel: links are processed, and a nearby name is
-       attempted (or the primary card name if available).
-    2. Known result container blocks are scanned; any phone numbers
-       found within them are associated with a heading or title found
-       inside the same block (fallback to primary name if present).
-    3. As a fallback, the entire page's inner text is scanned for phone
-       numbers; if a primary name exists, it is used.
+    Extract phone numbers and corresponding business names from the current page.
     """
     leads: Dict[str, Dict[str, Optional[str]]] = {}
+    if not _page_alive(page):
+        return []
+
     try:
-        # Determine whether we are on a listing (business details) page.  Only
-        # compute a primary business name when inside a Google Maps card
-        # (URL containing "/maps/place" or "/local/place").  On search
-        # result pages, avoid setting a fallback name to prevent all
-        # extracted numbers from inheriting the same business name.  When
-        # default_name is explicitly provided (e.g. when called from
-        # _open_and_extract_from_listing), honour it.
+        # Determine whether we are on a listing (business details) page
         primary: Optional[str] = None
         if default_name:
             primary = default_name
@@ -377,8 +399,11 @@ async def _extract_phones_from_page(page, default_name: Optional[str] = None) ->
             if "/maps/place" in url or "/local/place" in url:
                 primary = await _primary_business_name(page)
 
-        # Passo 1: <a href="tel:"> anchors e seu texto
-        anchors = await page.query_selector_all("a[href^='tel:']")
+        # Passo 1: anchors tel:
+        try:
+            anchors = await page.query_selector_all("a[href^='tel:']")
+        except Exception:
+            anchors = []
         for a in anchors or []:
             try:
                 href = (await a.get_attribute("href")) or ""
@@ -392,63 +417,58 @@ async def _extract_phones_from_page(page, default_name: Optional[str] = None) ->
             except Exception:
                 continue
 
-        # Passo 2: Varre blocos de resultados
+        # Passo 2: blocos de resultados
         for sel in RESULT_CONTAINERS:
+            if not _page_alive(page):
+                break
             try:
                 blocks = await page.query_selector_all(sel)
-                for block in blocks or []:
-                    try:
-                        txt = (await block.inner_text()) or ""
-                    except Exception:
-                        txt = ""
-                    if not txt:
-                        continue
-
-                    extracted = extract_phones_from_text(txt)
-                    if not extracted:
-                        continue
-
-                    # Tenta achar um nome dentro do bloco; se nada for
-                    # encontrado e estivermos em uma ficha (primary definido),
-                    # use-o como fallback.  Nas páginas de resultados
-                    # (primary é None), não atribua nenhum nome; isso evita
-                    # replicar o mesmo nome para múltiplos telefones.
-                    try:
-                        name_in_block = await page.evaluate(
-                            f"""(el) => {{
-                                const sels = {NAME_CANDIDATES!r};
-                                for (const s of sels) {{
-                                   const c = el.querySelector(s);
-                                   if (c && c.textContent) {{
-                                       const t = c.textContent.trim();
-                                       if (t) return t;
-                                   }}
-                                }}
-                                // fallback: aria-label do link para a ficha
-                                const a = el.querySelector('a[href*="/maps/place"],a[href*="/local/place"]');
-                                if (a) {{
-                                    const al = (a.getAttribute('aria-label') || a.textContent || '').trim();
-                                    if (al) return al;
-                                }}
-                                return null;
-                            }}""",
-                            block,
-                        )
-                    except Exception:
-                        name_in_block = None
-
-                    # Se nada encontrado, só use o 'primary' se estiver definido
-                    if not name_in_block and primary:
-                        name_in_block = primary
-
-                    for ph in extracted:
-                        if ph not in leads:
-                            leads[ph] = {"phone": ph, "name": (name_in_block or None)}
             except Exception:
-                continue
+                blocks = []
+            for block in blocks or []:
+                try:
+                    txt = (await block.inner_text()) or ""
+                except Exception:
+                    txt = ""
+                if not txt:
+                    continue
 
-        # Passo 3: Fallback geral no corpo
-        if not leads:
+                extracted = extract_phones_from_text(txt)
+                if not extracted:
+                    continue
+
+                try:
+                    name_in_block = await page.evaluate(
+                        f"""(el) => {{
+                            const sels = {NAME_CANDIDATES!r};
+                            for (const s of sels) {{
+                               const c = el.querySelector(s);
+                               if (c && c.textContent) {{
+                                   const t = c.textContent.trim();
+                                   if (t) return t;
+                               }}
+                            }}
+                            const a = el.querySelector('a[href*="/maps/place"],a[href*="/local/place"]');
+                            if (a) {{
+                                const al = (a.getAttribute('aria-label') || a.textContent || '').trim();
+                                if (al) return al;
+                            }}
+                            return null;
+                        }}""",
+                        block,
+                    )
+                except Exception:
+                    name_in_block = None
+
+                if not name_in_block and primary:
+                    name_in_block = primary
+
+                for ph in extracted:
+                    if ph not in leads:
+                        leads[ph] = {"phone": ph, "name": (name_in_block or None)}
+
+        # Passo 3: fallback no corpo
+        if not leads and _page_alive(page):
             try:
                 body_text = await page.evaluate(
                     "() => document.body ? (document.body.innerText || '') : ''"
@@ -467,9 +487,7 @@ async def _extract_phones_from_page(page, default_name: Optional[str] = None) ->
 
 def _city_variants(city: str) -> List[str]:
     """
-    Produce variations of the city string to broaden search queries. It
-    returns combinations with and without the state abbreviation and with
-    optional 'em ' prefix. Accent‑stripped variants are also included.
+    Produce variations of the city string to broaden search queries.
     """
     c = _city_alias(city)
     base = [c, f"{c} MG", f"{c}, MG"]
@@ -480,9 +498,7 @@ def _city_variants(city: str) -> List[str]:
 
 async def _is_captcha_or_sorry(page) -> bool:
     """
-    Detect whether the current page is a CAPTCHA or unusual traffic page. It
-    scans the page content for specific keywords and checks for recaptcha
-    forms. Extensible by adding further checks for additional languages.
+    Detect whether the current page is a CAPTCHA or unusual traffic page.
     """
     try:
         txt = (await page.content())[:120000].lower()
@@ -511,29 +527,14 @@ def _cooldown_secs(hit: int) -> int:
 # ---------- Playwright: browser único, contexto por request ----------
 _pw = None
 _browser = None
-
-# A global lock used to serialise Playwright initialisation. Without
-# this lock multiple concurrent calls to `_ensure_browser` could try to
-# start Playwright or launch a browser at the same time, leading to
-# race conditions and unpredictable failures. The lock is held only
-# around the startup section and does not impact subsequent browser
-# usage. See `_ensure_browser` for details.
 _pw_lock = asyncio.Lock()
 
 
 async def _ensure_browser():
     """
     Ensure that a single Playwright browser instance is running.
-
-    This function lazily starts Playwright and launches the configured
-    browser type. A per‑module lock prevents concurrent initialisation.
-    Logging statements record when the browser or Playwright are started.
-
-    Returns:
-        The running Playwright browser instance.
     """
     global _pw, _browser
-    # Ensure Playwright is available before attempting to start a browser.
     if async_playwright is None:
         raise ImportError(
             "Playwright is not installed. Install the 'playwright' package to use the scraper."
@@ -561,10 +562,7 @@ async def _ensure_browser():
 
 async def _new_context():
     """
-    Create a fresh browser context with randomized settings. Each context
-    gets its own user agent, timezone, locale, viewport, and optional
-    proxy configuration. We also inject scripts to mask automation
-    fingerprints.
+    Create a fresh browser context with randomized settings.
     """
     browser = await _ensure_browser()
     ua = settings.USER_AGENT or random.choice(UA_POOL)
@@ -581,9 +579,6 @@ async def _new_context():
         viewport={"width": random.randint(1200, 1360), "height": random.randint(820, 920)},
         **proxy_kwargs,
     )
-    # Mask automation fingerprints: remove webdriver flag and fake languages,
-    # plugins and chrome runtime. These changes help avoid simple bot
-    # detections on Google and other sites.
     await context.add_init_script(
         """
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -621,24 +616,22 @@ async def _open_and_extract_from_listing(
     excluded from the returned results and added to ``seen``. When
     ``seen`` is ``None`` the function will return all numbers found
     within the listing without filtering against previously seen
-    values. A per‑listing deduplication is always applied to avoid
-    returning the same phone multiple times from a single page.
+    values. A per‑listing deduplication is always applied.
     """
     out: List[Dict[str, Optional[str]]] = []
     if not href:
         return out
-    # Prepend host if relative path
     if href.startswith("/"):
         href = "https://www.google.com" + href
 
     page2 = await context.new_page()
     try:
-        # Navigate to the listing card
         await _safe_goto(page2, href, wait_until="domcontentloaded", timeout=30000)
-        # Attempt to extract the primary name of the business
+        if not _page_alive(page2):
+            return out
+
         primary_name = await _primary_business_name(page2)
 
-        # Try clicking on buttons/links that reveal phone numbers
         for sel in [
             "button:has-text('Telefone')",
             "button:has-text('Ligar')",
@@ -647,6 +640,8 @@ async def _open_and_extract_from_listing(
             "button:has-text('Contato')",
         ]:
             try:
+                if not _page_alive(page2):
+                    break
                 loc = page2.locator(sel)
                 if await loc.count() > 0 and await loc.first.is_visible():
                     await loc.first.click()
@@ -654,26 +649,22 @@ async def _open_and_extract_from_listing(
             except Exception:
                 pass
 
-        # Give the page a moment to update after revealing numbers
-        await page2.wait_for_timeout(800)
-        # Extract phones/names from the listing page
+        if _page_alive(page2):
+            await page2.wait_for_timeout(800)
+
         leads = await _extract_phones_from_page(page2, default_name=primary_name)
 
-        # Local deduplication to avoid duplicate phones from the same page
         added: Set[str] = set()
         for lead in leads:
             ph = lead.get("phone")
             if not ph or ph in added:
                 continue
             added.add(ph)
-            # If a ``seen`` set was supplied, only include numbers not
-            # previously processed.  Otherwise return all numbers.
             if seen is None or ph not in seen:
                 if seen is not None:
                     seen.add(ph)
                 out.append(lead)
     except (PWError, CancelledError, Exception):
-        # Intentionally swallow exceptions to keep scraping robust
         pass
     finally:
         try:
@@ -693,19 +684,6 @@ async def search_numbers(
 ) -> AsyncGenerator[Dict[str, Optional[str]], None]:
     """
     Asynchronously yield phone/name pairs scraped from Google Local results.
-
-    Args:
-        nicho: The niche (category) to search for, e.g. 'Marketing'.
-        locais: A list of cities to search within.
-        target: The maximum number of results to return. If zero or None,
-            the scraper will run indefinitely (up to the natural end of
-            results).
-        max_pages: Optional maximum pages per term to fetch; None means no
-            explicit limit. This parameter is primarily used for testing
-            because Google may present an effectively infinite result set.
-
-    Yields:
-        Dicts with keys 'phone' and 'name'.
     """
     seen: Set[str] = set()
     q_base = _clean_query(nicho)
@@ -713,21 +691,18 @@ async def search_numbers(
     captcha_hits_global = 0
 
     context = await _new_context()
-    # Log the start of a scraping job with the supplied parameters.
     log.info(
         f"Starting phone search: nicho='{nicho}', locais={locais}, target={target}, max_pages={max_pages}"
     )
 
     try:
         total_yield = 0
-        # Outer loop over provided cities
         for local in locais:
             city = (local or "").strip()
             if not city:
                 continue
             uule = _uule_for_city(city)
 
-            # Generate search terms combining niche variants and city variants
             terms: List[str] = []
             for v in _city_variants(city):
                 for qv in _niche_variants(q_base):
@@ -735,37 +710,27 @@ async def search_numbers(
                     if t and t not in terms:
                         terms.append(t)
 
-            # Iterate over each variant of the search term
             for term in terms:
                 empty_pages = 0
                 idx = 0
                 captcha_hits_term = 0
-                # Track whether we've switched to the generic Google search
                 use_local = True
-                # Count how many leads we have produced for this term (across both
-                # local and general searches) to decide whether to fallback
                 generated_this_term = 0
 
-                # Log each search term for clarity. Terms include variations of the niche and city.
                 log.info(f"Searching term '{term}' in city '{city}'")
 
                 while True:
-                    # Respect the overall target across all terms and cities
                     if target and total_yield >= target:
                         return
-                    # Optionally stop after a number of pages to avoid infinite loops
                     if max_pages is not None and idx >= max_pages:
                         break
 
                     start = idx * 20
                     q = term
                     if captcha_hits_term > 0:
-                        # Slightly vary the query string to bypass caching or rate limits
                         decorations = ["", " ", "  ", " ★", " ✔", " ✓"]
                         q = (term + random.choice(decorations)).strip()
 
-                    # Choose appropriate search URL. For local searches we append the uule
-                    # parameter; for generic searches we omit it entirely.
                     if use_local:
                         url = SEARCH_FMT.format(
                             query=urllib.parse.quote_plus(q), start=start, uule=uule
@@ -775,7 +740,6 @@ async def search_numbers(
                             query=urllib.parse.quote_plus(q), start=start
                         )
 
-                    # Create a new page for each request
                     page = await context.new_page()
                     page.set_default_timeout(20000)
 
@@ -785,7 +749,6 @@ async def search_numbers(
                                 page, url, wait_until="domcontentloaded", timeout=30000
                             )
                         except (PWError, CancelledError):
-                            # If navigation failed, close and retry once on a new page
                             try:
                                 await page.close()
                             except Exception:
@@ -799,14 +762,12 @@ async def search_numbers(
                         await _try_accept_consent(page)
                         await _humanize(page)
 
-                        # Check for CAPTCHA or unusual traffic pages
                         if await _is_captcha_or_sorry(page):
                             captcha_hits_term += 1
                             captcha_hits_global += 1
                             log.warning(
                                 f"CAPTCHA or unusual traffic detected (term='{term}', city='{city}', hit={captcha_hits_term}, global_hits={captcha_hits_global})."
                             )
-                            # Exponential backoff to avoid repeated CAPTCHAs
                             await page.wait_for_timeout(_cooldown_secs(captcha_hits_global) * 1000)
                             if captcha_hits_term >= 2:
                                 log.info(
@@ -815,27 +776,18 @@ async def search_numbers(
                                 idx += 1
                                 continue
 
-                        try:
-                            await page.wait_for_selector(
-                                "a[href^='tel:']," + ",".join(RESULT_CONTAINERS),
-                                timeout=8000,
-                            )
-                        except (PWTimeoutError, PWError, CancelledError, Exception):
-                            # A página pode ser fechada antes da espera terminar, o que
-                            # lança TargetClosedError ou outras exceções.  Capturamos
-                            # genericamente e seguimos em frente.
-                            pass
+                        # Espera segura por conteúdo (não explode se a página fechar)
+                        await _safe_wait_for_selector(
+                            page,
+                            "a[href^='tel:']," + ",".join(RESULT_CONTAINERS),
+                            timeout=8000,
+                            state="attached",
+                        )
 
+                        # Extração inicial (pode vir sem nomes na SERP)
                         leads = await _extract_phones_from_page(page)
 
-                        # Se encontramos números, verifique se os nomes
-                        # extraídos parecem confiáveis.  Se todos os nomes são
-                        # iguais ou se há entradas sem nome, trate todas essas
-                        # entradas como "missing" para forçar a abertura das
-                        # fichas e enriquecer corretamente.  Isso evita o
-                        # problema em que um nome de fallback (geralmente
-                        # proveniente de uma única ficha) é associado a todos
-                        # os números.
+                        # Enriquecimento de nomes quando necessário
                         if leads:
                             unique_names = set(
                                 (l.get("name") or "") for l in leads if l.get("name")
@@ -844,49 +796,48 @@ async def search_numbers(
                                 missing = leads[:]
                             else:
                                 missing = [l for l in leads if not (l or {}).get("name")]
-                            # Sempre tente enriquecimento quando houver nomes
-                            # ausentes ou suspeitos.  Em vez de usar tarefas
-                            # assíncronas em paralelo (que podem deixar
-                            # exceções sem tratamento se a página for fechada),
-                            # abrimos cada card sequencialmente até obter
-                            # nomes para todas as entradas necessárias.  O
-                            # número de fichas abertas é limitado ao número de
-                            # leads encontrados para tentar cobrir todos os
-                            # telefones.
-                            if missing:
+
+                            if missing and _page_alive(page):
                                 try:
                                     cards = page.locator(",".join(LISTING_LINK_SELECTORS))
                                     count = await cards.count()
-                                    # Definimos um limite máximo de fichas a abrir para
-                                    # enriquecimento. Abrir muitas fichas em sequência pode
-                                    # ser lento e aumentar a probabilidade de CAPTCHA. Ajuste
-                                    # este valor conforme a necessidade (padrão: 20).
                                     MAX_ENRICH_CARDS = 20
                                     to_open = min(count, MAX_ENRICH_CARDS)
+
+                                    # Conjunto dos telefones que realmente precisam de nome
+                                    missing_phones = {
+                                        (m.get("phone") or "") for m in missing if m.get("phone")
+                                    }
+                                    found_for_missing: Set[str] = set()
                                     enriched: List[Dict[str, Optional[str]]] = []
+
                                     for i in range(to_open):
                                         try:
                                             href = await cards.nth(i).get_attribute("href")
                                         except (PWError, Exception):
                                             href = None
                                         try:
-                                            # Ao enriquecer nomes, não deduplicamos via ``seen`` global.
-                                            # Passar ``None`` permite re-extrair números já vistos para
-                                            # capturar corretamente o nome da empresa.
+                                            # Não usa 'seen' no enriquecimento — precisamos re-extrair
+                                            # para mapear phone→name corretamente.
                                             res = await _open_and_extract_from_listing(context, href, None)
                                         except Exception:
                                             res = []
                                         if res:
                                             enriched.extend(res)
-                                            # Se já obtivemos nomes para todos os telefones com nome ausente,
-                                            # podemos parar para reduzir navegação.
-                                            if len({e.get("phone") for e in enriched}) >= len(missing):
+                                            # Atualiza o conjunto de missing cobertos
+                                            for e in res:
+                                                eph = e.get("phone")
+                                                if eph and eph in missing_phones:
+                                                    found_for_missing.add(eph)
+                                            # Agora só paramos quando TODOS os 'missing' foram cobertos
+                                            if missing_phones and missing_phones.issubset(found_for_missing):
                                                 break
-                                    # Associa os nomes extraídos aos telefones originais.
+
+                                    # phone->name apenas para os que interessam
                                     name_map = {
                                         e["phone"]: e.get("name")
                                         for e in enriched
-                                        if e.get("phone") and e.get("name")
+                                        if e.get("phone") in missing_phones and e.get("name")
                                     }
                                     for l in leads:
                                         if not l.get("name") or (len(unique_names) <= 1):
@@ -896,12 +847,11 @@ async def search_numbers(
                                 except (PWError, Exception):
                                     pass
 
-                        # If we didn't find any leads on this SERP page, open listing cards sequentially.
-                        if not leads:
+                        # Fallback: abrir cards se nada foi achado na SERP
+                        if not leads and _page_alive(page):
                             try:
                                 cards = page.locator(",".join(LISTING_LINK_SELECTORS))
                                 count = await cards.count()
-                                # Open at most 15 listings sequentially to try to extract numbers
                                 to_open = min(count, 15)
                                 for i in range(to_open):
                                     try:
@@ -909,20 +859,13 @@ async def search_numbers(
                                     except (PWError, Exception):
                                         href = None
                                     try:
-                                        # When no leads were found on the current SERP page we
-                                        # open listing cards sequentially to extract phone
-                                        # numbers.  Deduplication against the global ``seen`` set
-                                        # is desired here to avoid re‑emitting numbers that have
-                                        # already been collected elsewhere.
                                         res = await _open_and_extract_from_listing(context, href, seen)
                                     except Exception:
                                         res = []
                                     if res:
                                         leads.extend(res)
-                                        # Break early if we've collected a reasonable number of leads
                                         if len(leads) >= 25:
                                             break
-                                # No further gathering of tasks needed since we're opening sequentially
                             except (PWError, Exception):
                                 pass
 
@@ -949,14 +892,9 @@ async def search_numbers(
                                         pass
                                     return
 
-                        # Update empty page counter. If no new leads, increment; otherwise reset.
                         empty_pages = empty_pages + 1 if new == 0 else 0
 
-                        # If we've exhausted a number of pages without new leads, decide whether
-                        # to fallback to general search or move to the next term.
                         if empty_pages >= empty_limit:
-                            # If still using local search and we have produced very few leads
-                            # for this term, fall back to general search and reset counters.
                             if use_local and generated_this_term < 3:
                                 log.info(
                                     f"Few or no leads found for term '{term}' in local search. Falling back to general search."
@@ -966,7 +904,6 @@ async def search_numbers(
                                 idx = 0
                                 captcha_hits_term = 0
                                 continue
-                            # Otherwise break out to the next term.
                             log.info(
                                 f"Reached empty page limit ({empty_limit}) for term '{term}'. Moving to next term."
                             )
@@ -976,16 +913,14 @@ async def search_numbers(
                                 pass
                             break
 
-                        # Compute wait time between requests to mimic human behaviour and reduce detection
                         wait_ms = random.randint(320, 620) + min(
                             1800, int(idx * 48 + random.randint(140, 300))
                         )
-                        await page.wait_for_timeout(wait_ms)
+                        if _page_alive(page):
+                            await page.wait_for_timeout(wait_ms)
                         idx += 1
 
                     except (PWError, CancelledError, Exception):
-                        # Catch and handle any Playwright or other errors.  Close the page and
-                        # proceed to the next index.
                         try:
                             await page.close()
                         except Exception:
@@ -994,12 +929,11 @@ async def search_numbers(
                         continue
                     finally:
                         try:
-                            if not page.is_closed():
+                            if _page_alive(page):
                                 await page.close()
                         except Exception:
                             pass
     finally:
-        # Always close the context to free browser resources, and log summary.
         try:
             await context.close()
         except (PWError, CancelledError, Exception):
@@ -1009,8 +943,7 @@ async def search_numbers(
 
 async def shutdown_playwright():
     """
-    Gracefully close the Playwright browser and stop Playwright. This is
-    invoked at application shutdown to release resources.
+    Gracefully close the Playwright browser and stop Playwright.
     """
     global _pw, _browser
     log.info("Shutting down Playwright and browser…")
