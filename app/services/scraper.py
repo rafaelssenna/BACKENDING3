@@ -62,6 +62,7 @@ SEARCH_FMT_GENERAL = (
 )
 
 # CSS selectors for high‑level result containers on Google local search
+# Expanded to cover multiple Google layout variants (2024/2025)
 RESULT_CONTAINERS = [
     ".rlfl__tls",
     ".VkpGBb",
@@ -72,6 +73,11 @@ RESULT_CONTAINERS = [
     "div[role='main']",
     "#rhs",
     ".kp-wholepage",
+    ".uMdZh",  # 2024 local results
+    ".Nv2PK",  # business card wrapper
+    ".VkpGBb .cXedhc",  # nested result container
+    "[data-attrid='kc:/location/location:address']",  # address containers often near phones
+    ".I9GLp",  # new Maps integration
 ]
 
 # CSS selectors for links to individual business listings (cards). These
@@ -84,6 +90,9 @@ LISTING_LINK_SELECTORS = [
     "a[href*='ludocid=']",
     "a[href*='/search?'][href*='ludocid']",
     "a[href*='/search?'][href*='lrd=']",
+    "a[href*='maps/place'][data-cid]",  # Maps with CID
+    "a[data-fid]",  # Feature ID links
+    "a[jsname][href*='place']",  # JS-powered links
 ]
 
 # Labels of consent buttons that Google may present. Different languages and
@@ -118,6 +127,10 @@ NAME_CANDIDATES = [
     ".qBF1Pd",
     ".fontHeadlineSmall",
     ".OSrXXb",
+    "[data-attrid='title']",  # structured data title
+    ".tAiQdd",  # 2024 business name
+    "[aria-label*='Nome']",  # aria-label with name
+    "[jsname] .fontHeadlineLarge",  # large headline in new layout
 ]
 
 # Selectors com prioridade para o NOME EXATO do card (na ficha)
@@ -245,7 +258,7 @@ async def _safe_wait_for_selector(
     page,
     selector: str,
     *,
-    timeout: int = 8000,
+    timeout: int = None,
     state: str = "attached",
 ) -> bool:
     """
@@ -253,12 +266,15 @@ async def _safe_wait_for_selector(
     Returns True if the selector is observed (in the chosen state),
     otherwise False without raising.
     """
+    if timeout is None:
+        timeout = settings.SELECTOR_WAIT_TIMEOUT
     try:
         if not _page_alive(page):
             return False
         await page.wait_for_selector(selector, timeout=timeout, state=state)
         return True
-    except (PWTimeoutError, PWError, CancelledError, Exception):
+    except (PWTimeoutError, PWError, CancelledError, Exception) as e:
+        log.debug(f"Selector wait failed for '{selector[:50]}...': {e}")
         return False
 
 
@@ -499,18 +515,39 @@ def _city_variants(city: str) -> List[str]:
 async def _is_captcha_or_sorry(page) -> bool:
     """
     Detect whether the current page is a CAPTCHA or unusual traffic page.
+    Enhanced detection with multiple indicators.
     """
     try:
-        txt = (await page.content())[:120000].lower()
-        if (
-            "/sorry/" in txt
-            or "unusual traffic" in txt
-            or "recaptcha" in txt
-            or "g-recaptcha" in txt
-        ):
+        # Check URL first (fastest)
+        url = page.url or ""
+        if "/sorry/" in url or "showcaptcha" in url:
             return True
+        
+        # Check page title
+        try:
+            title = (await page.title()).lower()
+            if "captcha" in title or "unusual traffic" in title:
+                return True
+        except Exception:
+            pass
+        
+        # Check content (sample only to avoid huge payloads)
+        txt = (await page.content())[:150000].lower()
+        captcha_indicators = [
+            "/sorry/",
+            "unusual traffic",
+            "recaptcha",
+            "g-recaptcha",
+            "captcha-box",
+            "tráfego incomum",  # Portuguese
+            "verify you're not a robot",
+        ]
+        if any(indicator in txt for indicator in captcha_indicators):
+            return True
+        
+        # Check for CAPTCHA elements
         sel_hit = await page.locator(
-            "form[action*='/sorry'], iframe[src*='recaptcha'], #recaptcha"
+            "form[action*='/sorry'], iframe[src*='recaptcha'], #recaptcha, .g-recaptcha"
         ).count()
         return sel_hit > 0
     except Exception:
@@ -519,9 +556,37 @@ async def _is_captcha_or_sorry(page) -> bool:
 
 def _cooldown_secs(hit: int) -> int:
     """Calculate an exponential backoff delay based on CAPTCHA hits."""
-    base = 18
-    mx = 110
-    return min(mx, int(base * (1.6 ** max(0, hit - 1))) + random.randint(0, 9))
+    base = settings.CAPTCHA_COOLDOWN_BASE
+    mx = settings.CAPTCHA_MAX_COOLDOWN
+    return min(mx, int(base * (1.5 ** max(0, hit - 1))) + random.randint(0, 12))
+
+
+async def _retry_with_backoff(func, *args, max_attempts: int = None, **kwargs):
+    """
+    Execute a function with exponential backoff retry logic.
+    Useful for recovering from transient network errors.
+    """
+    if max_attempts is None:
+        max_attempts = settings.MAX_RETRIES
+    
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            return await func(*args, **kwargs)
+        except (PWError, PWTimeoutError, Exception) as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                delay = settings.RETRY_DELAY_MS * (1.8 ** attempt) / 1000.0
+                log.warning(
+                    f"Attempt {attempt + 1}/{max_attempts} failed: {e}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
+            else:
+                log.error(
+                    f"All {max_attempts} attempts failed. Last error: {last_error}"
+                )
+    raise last_error
 
 
 # ---------- Playwright: browser único, contexto por request ----------
@@ -591,16 +656,36 @@ async def _new_context():
 
 
 # ---------- navegação blindada ----------
-async def _safe_goto(page, url: str, **kw):
-    """Navigate to a URL while shielding against task cancellation."""
-    try:
-        return await asyncio.shield(page.goto(url, **kw))
-    except CancelledError:
+async def _safe_goto(page, url: str, retries: int = 2, **kw):
+    """
+    Navigate to a URL with retry logic and cancellation protection.
+    Applies sensible defaults for timeouts and wait conditions.
+    """
+    if "timeout" not in kw:
+        kw["timeout"] = settings.NAVIGATION_TIMEOUT
+    if "wait_until" not in kw:
+        kw["wait_until"] = "domcontentloaded"
+    
+    for attempt in range(retries + 1):
         try:
-            await page.close()
-        except Exception:
-            pass
-        raise
+            return await asyncio.shield(page.goto(url, **kw))
+        except CancelledError:
+            try:
+                await page.close()
+            except Exception:
+                pass
+            raise
+        except (PWError, PWTimeoutError) as e:
+            if attempt < retries:
+                wait = 1.5 * (attempt + 1)
+                log.warning(
+                    f"Navigation to {url[:80]} failed (attempt {attempt + 1}/{retries + 1}): {e}. "
+                    f"Retrying in {wait:.1f}s..."
+                )
+                await asyncio.sleep(wait)
+            else:
+                log.error(f"Failed to navigate to {url[:80]} after {retries + 1} attempts: {e}")
+                raise
 
 
 # ---------- abrir ficha ----------
@@ -626,31 +711,48 @@ async def _open_and_extract_from_listing(
 
     page2 = await context.new_page()
     try:
-        await _safe_goto(page2, href, wait_until="domcontentloaded", timeout=30000)
+        # Navigate with built-in retry
+        await _safe_goto(page2, href, retries=2)
         if not _page_alive(page2):
             return out
 
+        # Wait for page to stabilize
+        await asyncio.sleep(0.5)
+        
         primary_name = await _primary_business_name(page2)
 
-        for sel in [
+        # Try to reveal phone numbers by clicking buttons
+        phone_reveal_selectors = [
             "button:has-text('Telefone')",
             "button:has-text('Ligar')",
+            "button:has-text('Phone')",
             "a[aria-label^='Ligar']",
+            "a[aria-label^='Call']",
             "[aria-label*='Telefone']",
+            "[aria-label*='Phone']",
             "button:has-text('Contato')",
-        ]:
+            "button:has-text('Contact')",
+            "[data-item-id*='phone']",
+        ]
+        
+        for sel in phone_reveal_selectors:
             try:
                 if not _page_alive(page2):
                     break
                 loc = page2.locator(sel)
-                if await loc.count() > 0 and await loc.first.is_visible():
-                    await loc.first.click()
-                    await page2.wait_for_timeout(350)
-            except Exception:
+                count = await loc.count()
+                if count > 0:
+                    first = loc.first
+                    if await first.is_visible(timeout=1000):
+                        await first.click()
+                        await page2.wait_for_timeout(400)
+                        log.debug(f"Clicked phone reveal button: {sel}")
+            except Exception as e:
+                log.debug(f"Failed to click {sel}: {e}")
                 pass
 
         if _page_alive(page2):
-            await page2.wait_for_timeout(800)
+            await page2.wait_for_timeout(1000)
 
         leads = await _extract_phones_from_page(page2, default_name=primary_name)
 
@@ -687,12 +789,12 @@ async def search_numbers(
     """
     seen: Set[str] = set()
     q_base = _clean_query(nicho)
-    empty_limit = int(getattr(settings, "MAX_EMPTY_PAGES", 14))
+    empty_limit = settings.MAX_EMPTY_PAGES
     captcha_hits_global = 0
 
     context = await _new_context()
     log.info(
-        f"Starting phone search: nicho='{nicho}', locais={locais}, target={target}, max_pages={max_pages}"
+        f"🔍 Starting phone search: nicho='{nicho}', locais={locais}, target={target}, max_pages={max_pages}"
     )
 
     try:
@@ -710,229 +812,226 @@ async def search_numbers(
                     if t and t not in terms:
                         terms.append(t)
 
-            for term in terms:
-                empty_pages = 0
-                idx = 0
-                captcha_hits_term = 0
-                use_local = True
-                generated_this_term = 0
+                for term in terms:
+                    empty_pages = 0
+                    idx = 0
+                    captcha_hits_term = 0
+                    use_local = True
+                    generated_this_term = 0
 
-                log.info(f"Searching term '{term}' in city '{city}'")
+                    log.info(f"🔎 Searching term '{term}' in city '{city}'")
 
-                while True:
-                    if target and total_yield >= target:
-                        return
-                    if max_pages is not None and idx >= max_pages:
-                        break
+                    while True:
+                        if target and total_yield >= target:
+                            return
+                        if max_pages is not None and idx >= max_pages:
+                            break
 
-                    start = idx * 20
-                    q = term
-                    if captcha_hits_term > 0:
-                        decorations = ["", " ", "  ", " ★", " ✔", " ✓"]
-                        q = (term + random.choice(decorations)).strip()
+                        start = idx * 20
+                        q = term
+                        if captcha_hits_term > 0:
+                            decorations = ["", " ", "  ", " ★", " ✔", " ✓"]
+                            q = (term + random.choice(decorations)).strip()
 
-                    if use_local:
-                        url = SEARCH_FMT.format(
-                            query=urllib.parse.quote_plus(q), start=start, uule=uule
-                        )
-                    else:
-                        url = SEARCH_FMT_GENERAL.format(
-                            query=urllib.parse.quote_plus(q), start=start
-                        )
+                        if use_local:
+                            url = SEARCH_FMT.format(
+                                query=urllib.parse.quote_plus(q), start=start, uule=uule
+                            )
+                        else:
+                            url = SEARCH_FMT_GENERAL.format(
+                                query=urllib.parse.quote_plus(q), start=start
+                            )
 
-                    page = await context.new_page()
-                    page.set_default_timeout(20000)
+                        page = await context.new_page()
+                        page.set_default_timeout(settings.NAVIGATION_TIMEOUT)
 
-                    try:
                         try:
-                            await _safe_goto(
-                                page, url, wait_until="domcontentloaded", timeout=30000
-                            )
-                        except (PWError, CancelledError):
-                            try:
-                                await page.close()
-                            except Exception:
-                                pass
-                            page = await context.new_page()
-                            page.set_default_timeout(20000)
-                            await _safe_goto(
-                                page, url, wait_until="domcontentloaded", timeout=30000
-                            )
+                            # Use _safe_goto with built-in retry
+                            await _safe_goto(page, url, retries=2)
 
-                        await _try_accept_consent(page)
-                        await _humanize(page)
+                            await _try_accept_consent(page)
+                            await _humanize(page)
 
-                        if await _is_captcha_or_sorry(page):
-                            captcha_hits_term += 1
-                            captcha_hits_global += 1
-                            log.warning(
-                                f"CAPTCHA or unusual traffic detected (term='{term}', city='{city}', hit={captcha_hits_term}, global_hits={captcha_hits_global})."
-                            )
-                            await page.wait_for_timeout(_cooldown_secs(captcha_hits_global) * 1000)
-                            if captcha_hits_term >= 2:
-                                log.info(
-                                    f"Skipping to next page for term '{term}' due to repeated CAPTCHA hits"
+                            if await _is_captcha_or_sorry(page):
+                                captcha_hits_term += 1
+                                captcha_hits_global += 1
+                                cooldown = _cooldown_secs(captcha_hits_global)
+                                log.warning(
+                                    f"⚠️ CAPTCHA detected (term='{term}', city='{city}', hit={captcha_hits_term}, "
+                                    f"global_hits={captcha_hits_global}). Cooling down for {cooldown}s..."
                                 )
-                                idx += 1
-                                continue
+                                await page.wait_for_timeout(cooldown * 1000)
+                                if captcha_hits_term >= 3:
+                                    log.info(
+                                        f"⏭️ Skipping to next page for term '{term}' due to repeated CAPTCHA hits"
+                                    )
+                                    idx += 1
+                                    continue
 
-                        # Espera segura por conteúdo (não explode se a página fechar)
-                        await _safe_wait_for_selector(
-                            page,
-                            "a[href^='tel:']," + ",".join(RESULT_CONTAINERS),
-                            timeout=8000,
-                            state="attached",
-                        )
-
-                        # Extração inicial (pode vir sem nomes na SERP)
-                        leads = await _extract_phones_from_page(page)
-
-                        # Enriquecimento de nomes quando necessário
-                        if leads:
-                            unique_names = set(
-                                (l.get("name") or "") for l in leads if l.get("name")
+                            # Espera segura por conteúdo (não explode se a página fechar)
+                            await _safe_wait_for_selector(
+                                page,
+                                "a[href^='tel:']," + ",".join(RESULT_CONTAINERS),
+                                state="attached",
                             )
-                            if len(unique_names) <= 1:
-                                missing = leads[:]
-                            else:
-                                missing = [l for l in leads if not (l or {}).get("name")]
 
-                            if missing and _page_alive(page):
+                            # Extração inicial (pode vir sem nomes na SERP)
+                            leads = await _extract_phones_from_page(page)
+
+                            # Enriquecimento de nomes quando necessário
+                            if leads:
+                                unique_names = set(
+                                    (l.get("name") or "") for l in leads if l.get("name")
+                                )
+                                if len(unique_names) <= 1:
+                                    missing = leads[:]
+                                else:
+                                    missing = [l for l in leads if not (l or {}).get("name")]
+
+                                if missing and _page_alive(page):
+                                    try:
+                                        cards = page.locator(",".join(LISTING_LINK_SELECTORS))
+                                        count = await cards.count()
+                                        MAX_ENRICH_CARDS = 25
+                                        to_open = min(count, MAX_ENRICH_CARDS)
+
+                                        # Conjunto dos telefones que realmente precisam de nome
+                                        missing_phones = {
+                                            (m.get("phone") or "") for m in missing if m.get("phone")
+                                        }
+                                        found_for_missing: Set[str] = set()
+                                        enriched: List[Dict[str, Optional[str]]] = []
+
+                                        log.debug(f"📋 Enriching {len(missing_phones)} phone(s) from {to_open} cards")
+
+                                        for i in range(to_open):
+                                            try:
+                                                href = await cards.nth(i).get_attribute("href")
+                                            except (PWError, Exception):
+                                                href = None
+                                            try:
+                                                # Não usa 'seen' no enriquecimento — precisamos re-extrair
+                                                # para mapear phone→name corretamente.
+                                                res = await _open_and_extract_from_listing(context, href, None)
+                                            except Exception as e:
+                                                log.debug(f"Failed to extract from listing: {e}")
+                                                res = []
+                                            if res:
+                                                enriched.extend(res)
+                                                # Atualiza o conjunto de missing cobertos
+                                                for e in res:
+                                                    eph = e.get("phone")
+                                                    if eph and eph in missing_phones:
+                                                        found_for_missing.add(eph)
+                                                # Agora só paramos quando TODOS os 'missing' foram cobertos
+                                                if missing_phones and missing_phones.issubset(found_for_missing):
+                                                    log.debug(f"✅ All missing phones enriched")
+                                                    break
+
+                                        # phone->name apenas para os que interessam
+                                        name_map = {
+                                            e["phone"]: e.get("name")
+                                            for e in enriched
+                                            if e.get("phone") in missing_phones and e.get("name")
+                                        }
+                                        for l in leads:
+                                            if not l.get("name") or (len(unique_names) <= 1):
+                                                nm = name_map.get(l["phone"])
+                                                if nm:
+                                                    l["name"] = nm
+                                    except (PWError, Exception) as e:
+                                        log.warning(f"Name enrichment failed: {e}")
+                                        pass
+
+                            # Fallback: abrir cards se nada foi achado na SERP
+                            if not leads and _page_alive(page):
+                                log.debug("No phones on SERP, opening cards as fallback...")
                                 try:
                                     cards = page.locator(",".join(LISTING_LINK_SELECTORS))
                                     count = await cards.count()
-                                    MAX_ENRICH_CARDS = 20
-                                    to_open = min(count, MAX_ENRICH_CARDS)
-
-                                    # Conjunto dos telefones que realmente precisam de nome
-                                    missing_phones = {
-                                        (m.get("phone") or "") for m in missing if m.get("phone")
-                                    }
-                                    found_for_missing: Set[str] = set()
-                                    enriched: List[Dict[str, Optional[str]]] = []
-
+                                    to_open = min(count, 15)
                                     for i in range(to_open):
                                         try:
                                             href = await cards.nth(i).get_attribute("href")
                                         except (PWError, Exception):
                                             href = None
                                         try:
-                                            # Não usa 'seen' no enriquecimento — precisamos re-extrair
-                                            # para mapear phone→name corretamente.
-                                            res = await _open_and_extract_from_listing(context, href, None)
+                                            res = await _open_and_extract_from_listing(context, href, seen)
                                         except Exception:
                                             res = []
                                         if res:
-                                            enriched.extend(res)
-                                            # Atualiza o conjunto de missing cobertos
-                                            for e in res:
-                                                eph = e.get("phone")
-                                                if eph and eph in missing_phones:
-                                                    found_for_missing.add(eph)
-                                            # Agora só paramos quando TODOS os 'missing' foram cobertos
-                                            if missing_phones and missing_phones.issubset(found_for_missing):
+                                            leads.extend(res)
+                                            if len(leads) >= 25:
                                                 break
-
-                                    # phone->name apenas para os que interessam
-                                    name_map = {
-                                        e["phone"]: e.get("name")
-                                        for e in enriched
-                                        if e.get("phone") in missing_phones and e.get("name")
-                                    }
-                                    for l in leads:
-                                        if not l.get("name") or (len(unique_names) <= 1):
-                                            nm = name_map.get(l["phone"])
-                                            if nm:
-                                                l["name"] = nm
-                                except (PWError, Exception):
+                                except (PWError, Exception) as e:
+                                    log.debug(f"Fallback card extraction failed: {e}")
                                     pass
 
-                        # Fallback: abrir cards se nada foi achado na SERP
-                        if not leads and _page_alive(page):
-                            try:
-                                cards = page.locator(",".join(LISTING_LINK_SELECTORS))
-                                count = await cards.count()
-                                to_open = min(count, 15)
-                                for i in range(to_open):
-                                    try:
-                                        href = await cards.nth(i).get_attribute("href")
-                                    except (PWError, Exception):
-                                        href = None
-                                    try:
-                                        res = await _open_and_extract_from_listing(context, href, seen)
-                                    except Exception:
-                                        res = []
-                                    if res:
-                                        leads.extend(res)
-                                        if len(leads) >= 25:
-                                            break
-                            except (PWError, Exception):
-                                pass
+                            new = 0
+                            for lead in leads:
+                                ph = (lead or {}).get("phone")
+                                nm = (lead or {}).get("name")
+                                if not ph:
+                                    continue
+                                if ph not in seen:
+                                    seen.add(ph)
+                                    new += 1
+                                    total_yield += 1
+                                    generated_this_term += 1
+                                    log.debug(f"✅ New lead: {nm or '(sem nome)'} — {ph}")
+                                    yield {"phone": ph, "name": nm}
+                                    if target and total_yield >= target:
+                                        log.info(
+                                            f"🎯 Target of {target} leads reached. Terminating search."
+                                        )
+                                        try:
+                                            await page.close()
+                                        except Exception:
+                                            pass
+                                        return
 
-                        new = 0
-                        for lead in leads:
-                            ph = (lead or {}).get("phone")
-                            nm = (lead or {}).get("name")
-                            if not ph:
-                                continue
-                            if ph not in seen:
-                                seen.add(ph)
-                                new += 1
-                                total_yield += 1
-                                generated_this_term += 1
-                                log.debug(f"New lead: {nm or '(sem nome)'} — {ph}")
-                                yield {"phone": ph, "name": nm}
-                                if target and total_yield >= target:
+                            empty_pages = empty_pages + 1 if new == 0 else 0
+
+                            if empty_pages >= empty_limit:
+                                if use_local and generated_this_term < 3:
                                     log.info(
-                                        f"Target of {target} leads reached. Terminating search."
+                                        f"🔄 Few or no leads found for term '{term}' in local search. Falling back to general search."
                                     )
-                                    try:
-                                        await page.close()
-                                    except Exception:
-                                        pass
-                                    return
-
-                        empty_pages = empty_pages + 1 if new == 0 else 0
-
-                        if empty_pages >= empty_limit:
-                            if use_local and generated_this_term < 3:
+                                    use_local = False
+                                    empty_pages = 0
+                                    idx = 0
+                                    captcha_hits_term = 0
+                                    continue
                                 log.info(
-                                    f"Few or no leads found for term '{term}' in local search. Falling back to general search."
+                                    f"⏭️ Reached empty page limit ({empty_limit}) for term '{term}'. Moving to next term."
                                 )
-                                use_local = False
-                                empty_pages = 0
-                                idx = 0
-                                captcha_hits_term = 0
-                                continue
-                            log.info(
-                                f"Reached empty page limit ({empty_limit}) for term '{term}'. Moving to next term."
+                                try:
+                                    await page.close()
+                                except Exception:
+                                    pass
+                                break
+
+                            wait_ms = random.randint(320, 620) + min(
+                                1800, int(idx * 48 + random.randint(140, 300))
                             )
+                            if _page_alive(page):
+                                await page.wait_for_timeout(wait_ms)
+                            idx += 1
+
+                        except (PWError, CancelledError, Exception) as e:
+                            log.error(f"❌ Error processing page {idx} for term '{term}': {e}")
                             try:
                                 await page.close()
                             except Exception:
                                 pass
-                            break
-
-                        wait_ms = random.randint(320, 620) + min(
-                            1800, int(idx * 48 + random.randint(140, 300))
-                        )
-                        if _page_alive(page):
-                            await page.wait_for_timeout(wait_ms)
-                        idx += 1
-
-                    except (PWError, CancelledError, Exception):
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-                        idx += 1
-                        continue
-                    finally:
-                        try:
-                            if _page_alive(page):
-                                await page.close()
-                        except Exception:
-                            pass
+                            idx += 1
+                            continue
+                        finally:
+                            try:
+                                if _page_alive(page):
+                                    await page.close()
+                            except Exception:
+                                pass
     finally:
         try:
             await context.close()
