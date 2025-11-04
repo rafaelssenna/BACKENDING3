@@ -66,6 +66,15 @@ try:
         MAX_PAGES_PER_QUERY: int = 1000
         LISTING_CONCURRENCY: int = 3
         PROXY_SERVER: Optional[str] = None
+        
+        # Retry & Resilience
+        MAX_RETRIES: int = 3
+        RETRY_DELAY_MS: int = 2000
+        NAVIGATION_TIMEOUT: int = 45000
+        SELECTOR_WAIT_TIMEOUT: int = 12000
+        MAX_EMPTY_PAGES: int = 20
+        CAPTCHA_COOLDOWN_BASE: int = 25
+        CAPTCHA_MAX_COOLDOWN: int = 180
 
         # Verifier
         UAZAPI_BATCH_SIZE: int = 50
@@ -124,6 +133,15 @@ except ImportError:
             )
             proxy = os.getenv("PROXY_SERVER")
             self.PROXY_SERVER: Optional[str] = proxy if proxy else None
+            
+            # Retry & Resilience
+            self.MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
+            self.RETRY_DELAY_MS: int = int(os.getenv("RETRY_DELAY_MS", "2000"))
+            self.NAVIGATION_TIMEOUT: int = int(os.getenv("NAVIGATION_TIMEOUT", "45000"))
+            self.SELECTOR_WAIT_TIMEOUT: int = int(os.getenv("SELECTOR_WAIT_TIMEOUT", "12000"))
+            self.MAX_EMPTY_PAGES: int = int(os.getenv("MAX_EMPTY_PAGES", "20"))
+            self.CAPTCHA_COOLDOWN_BASE: int = int(os.getenv("CAPTCHA_COOLDOWN_BASE", "25"))
+            self.CAPTCHA_MAX_COOLDOWN: int = int(os.getenv("CAPTCHA_MAX_COOLDOWN", "180"))
 
             # Verifier
             self.UAZAPI_BATCH_SIZE: int = int(
