@@ -847,19 +847,34 @@ async def search_numbers(
 
                         try:
                             # Use _safe_goto with built-in retry
+                            log.info(f"🌐 Navigating to: {url[:100]}")
                             await _safe_goto(page, url, retries=2)
+                            log.info(f"✅ Page loaded successfully: {page.url[:100]}")
 
                             await _try_accept_consent(page)
                             await _humanize(page)
 
-                            if await _is_captcha_or_sorry(page):
+                            is_captcha = await _is_captcha_or_sorry(page)
+                            if is_captcha:
                                 captcha_hits_term += 1
                                 captcha_hits_global += 1
                                 cooldown = _cooldown_secs(captcha_hits_global)
-                                log.warning(
-                                    f"⚠️ CAPTCHA detected (term='{term}', city='{city}', hit={captcha_hits_term}, "
-                                    f"global_hits={captcha_hits_global}). Cooling down for {cooldown}s..."
-                                )
+                                
+                                # Tentar capturar screenshot para debug
+                                try:
+                                    screenshot_path = f"/tmp/captcha_debug_{captcha_hits_global}.png"
+                                    await page.screenshot(path=screenshot_path)
+                                    log.error(
+                                        f"🚫 GOOGLE BLOQUEOU COM CAPTCHA! (term='{term}', city='{city}', hit={captcha_hits_term}, "
+                                        f"global_hits={captcha_hits_global}). URL: {page.url[:150]}. "
+                                        f"Screenshot salvo em: {screenshot_path}. Cooling down for {cooldown}s..."
+                                    )
+                                except Exception:
+                                    log.error(
+                                        f"🚫 GOOGLE BLOQUEOU COM CAPTCHA! (term='{term}', city='{city}', hit={captcha_hits_term}, "
+                                        f"global_hits={captcha_hits_global}). URL: {page.url[:150]}. Cooling down for {cooldown}s..."
+                                    )
+                                
                                 await page.wait_for_timeout(cooldown * 1000)
                                 if captcha_hits_term >= 3:
                                     log.info(
@@ -877,6 +892,7 @@ async def search_numbers(
 
                             # Extração inicial (pode vir sem nomes na SERP)
                             leads = await _extract_phones_from_page(page)
+                            log.info(f"📱 Extracted {len(leads)} phone(s) from SERP")
 
                             # Enriquecimento de nomes quando necessário
                             if leads:
