@@ -506,7 +506,7 @@ def _city_variants(city: str) -> List[str]:
     Produce variations of the city string to broaden search queries.
     """
     c = _city_alias(city)
-    base = [c, f"{c} MG", f"{c}, MG"]
+    base = [c]
     no_acc = list({_norm_ascii(x) for x in base})
     variants = base + [f"em {x}" for x in base] + no_acc + [f"em {x}" for x in no_acc]
     return list(dict.fromkeys(variants))
@@ -641,7 +641,11 @@ async def _new_context():
     Create a fresh browser context with randomized settings.
     """
     browser = await _ensure_browser()
-    ua = settings.USER_AGENT or random.choice(UA_POOL)
+    ua = (
+        random.choice(UA_POOL)
+        if (getattr(settings, "USER_AGENT", "") or "").lower() == "random"
+        else (settings.USER_AGENT or random.choice(UA_POOL))
+    )
     proxy_kwargs = {}
     proxy_server = getattr(settings, "PROXY_SERVER", None)
     if proxy_server:
@@ -663,6 +667,19 @@ async def _new_context():
         window.chrome = { runtime: {} };
         """
     )
+    async def _route_handler(route):
+        try:
+            rt = route.request.resource_type
+            if rt in ("image", "media", "font"):
+                await route.abort()
+            else:
+                await route.continue_()
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+    await context.route("**/*", _route_handler)
     return context
 
 
@@ -816,14 +833,16 @@ async def search_numbers(
                 continue
             uule = _uule_for_city(city)
 
-            terms: List[str] = []
+            all_terms: List[str] = []
+            seen_terms: Set[str] = set()
             for v in _city_variants(city):
                 for qv in _niche_variants(q_base):
                     t = f"{qv} {v}".strip()
-                    if t and t not in terms:
-                        terms.append(t)
+                    if t and t not in seen_terms:
+                        seen_terms.add(t)
+                        all_terms.append(t)
 
-                for term in terms:
+            for term in all_terms:
                     empty_pages = 0
                     idx = 0
                     captcha_hits_term = 0
@@ -873,12 +892,18 @@ async def search_numbers(
                                 )
                                 log.warning(f"🔗 URL that triggered CAPTCHA: {page.url}")
                                 await page.wait_for_timeout(cooldown * 1000)
-                                if captcha_hits_term >= 3:
-                                    log.warning(
-                                        f"⏭️ Skipping to next page for term '{term}' due to repeated CAPTCHA hits"
-                                    )
-                                    idx += 1
-                                    continue
+                                try:
+                                    await page.close()
+                                except Exception:
+                                    pass
+                                if (captcha_hits_term % 2) == 0:
+                                    try:
+                                        await context.close()
+                                    except Exception:
+                                        pass
+                                    context = await _new_context()
+                                idx += 1
+                                continue
 
                             # Espera segura por conteúdo (não explode se a página fechar)
                             await _safe_wait_for_selector(
@@ -911,34 +936,28 @@ async def search_numbers(
                                         missing_phones = {
                                             (m.get("phone") or "") for m in missing if m.get("phone")
                                         }
-                                        found_for_missing: Set[str] = set()
                                         enriched: List[Dict[str, Optional[str]]] = []
 
-                                        log.debug(f"📋 Enriching {len(missing_phones)} phone(s) from {to_open} cards")
+                                        # Concurrency limitada na abertura das fichas para acelerar
+                                        sem = asyncio.Semaphore(getattr(settings, "LISTING_CONCURRENCY", 3))
 
-                                        for i in range(to_open):
+                                        async def run_card(i: int):
                                             try:
                                                 href = await cards.nth(i).get_attribute("href")
                                             except (PWError, Exception):
                                                 href = None
-                                            try:
-                                                # Não usa 'seen' no enriquecimento — precisamos re-extrair
-                                                # para mapear phone→name corretamente.
-                                                res = await _open_and_extract_from_listing(context, href, None)
-                                            except Exception as e:
-                                                log.debug(f"Failed to extract from listing: {e}")
-                                                res = []
+                                            async with sem:
+                                                try:
+                                                    return await _open_and_extract_from_listing(context, href, None)
+                                                except Exception as e:
+                                                    log.debug(f"Failed to extract from listing: {e}")
+                                                    return []
+
+                                        tasks = [asyncio.create_task(run_card(i)) for i in range(to_open)]
+                                        results = await asyncio.gather(*tasks, return_exceptions=False)
+                                        for res in results:
                                             if res:
                                                 enriched.extend(res)
-                                                # Atualiza o conjunto de missing cobertos
-                                                for e in res:
-                                                    eph = e.get("phone")
-                                                    if eph and eph in missing_phones:
-                                                        found_for_missing.add(eph)
-                                                # Agora só paramos quando TODOS os 'missing' foram cobertos
-                                                if missing_phones and missing_phones.issubset(found_for_missing):
-                                                    log.debug(f"✅ All missing phones enriched")
-                                                    break
 
                                         # phone->name apenas para os que interessam
                                         name_map = {
@@ -962,15 +981,23 @@ async def search_numbers(
                                     cards = page.locator(",".join(LISTING_LINK_SELECTORS))
                                     count = await cards.count()
                                     to_open = min(count, 15)
-                                    for i in range(to_open):
+
+                                    sem_fb = asyncio.Semaphore(getattr(settings, "LISTING_CONCURRENCY", 3))
+
+                                    async def run_fb(i: int):
                                         try:
                                             href = await cards.nth(i).get_attribute("href")
                                         except (PWError, Exception):
                                             href = None
-                                        try:
-                                            res = await _open_and_extract_from_listing(context, href, seen)
-                                        except Exception:
-                                            res = []
+                                        async with sem_fb:
+                                            try:
+                                                return await _open_and_extract_from_listing(context, href, seen)
+                                            except Exception:
+                                                return []
+
+                                    tasks = [asyncio.create_task(run_fb(i)) for i in range(to_open)]
+                                    results = await asyncio.gather(*tasks, return_exceptions=False)
+                                    for res in results:
                                         if res:
                                             leads.extend(res)
                                             if len(leads) >= 25:
