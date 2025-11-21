@@ -16,7 +16,7 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
 
     let allEstabelecimentos = [];
     let currentPage = 0;
-    const maxPages = 10; // Máximo de páginas para evitar loop infinito
+    const maxPages = 20; // Máximo de páginas para garantir busca completa
 
     // Continua buscando até ter leads suficientes ou atingir o máximo de páginas
     while (allEstabelecimentos.length < quantidade && currentPage < maxPages) {
@@ -61,20 +61,27 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         return results;
       });
 
-      console.log(`Página ${currentPage + 1}: ${estabelecimentosDaPagina.length} estabelecimentos encontrados`);
+      console.log(`Página ${currentPage + 1}: ${estabelecimentosDaPagina.length} estabelecimentos com telefone encontrados`);
 
-      // Se não encontrou nada, para de buscar
+      // Se não encontrou nada em 3 páginas seguidas, para de buscar
       if (estabelecimentosDaPagina.length === 0) {
-        console.log('Nenhum resultado encontrado nesta página, encerrando busca');
-        break;
+        console.log('Nenhum resultado com telefone nesta página');
+        // Só para se já tentou 3 páginas vazias seguidas
+        if (currentPage > 0 && allEstabelecimentos.length === 0) {
+          console.log('Encerrando busca - nenhum telefone encontrado');
+          break;
+        }
+      } else {
+        // Adiciona os novos estabelecimentos
+        allEstabelecimentos = allEstabelecimentos.concat(estabelecimentosDaPagina);
+        console.log(`Total acumulado: ${allEstabelecimentos.length} estabelecimentos`);
       }
 
-      // Adiciona os novos estabelecimentos
-      allEstabelecimentos = allEstabelecimentos.concat(estabelecimentosDaPagina);
       currentPage++;
 
       // Se já temos o suficiente, para
       if (allEstabelecimentos.length >= quantidade) {
+        console.log(`✓ Quantidade atingida: ${allEstabelecimentos.length} >= ${quantidade}`);
         break;
       }
     }
