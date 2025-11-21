@@ -10,13 +10,20 @@ API para extração de contatos do Google Maps (Google Local) em tempo real com 
 - Remoção automática de duplicatas
 - Progress tracking em tempo real
 - API REST com Express
+- **🛡️ Sistema Anti-Detecção Avançado** - evita RECAPTCHA e bloqueios
+  - Stealth mode com puppeteer-extra
+  - Comportamento humano simulado (mouse, scroll, delays)
+  - User agents realistas e rotativos
+  - Fingerprinting avançado
 
 ## Tecnologias
 
 - Node.js
 - Express.js
 - Socket.io (WebSocket)
-- Puppeteer (Web Scraping)
+- Puppeteer Extra (Web Scraping com Stealth)
+- Puppeteer Stealth Plugin (Anti-detecção)
+- User Agents (Rotação de navegadores)
 - CORS habilitado
 
 ## Instalação
@@ -161,12 +168,34 @@ Para desenvolvimento com auto-reload:
 npm run dev
 ```
 
+## 🛡️ Sistema Anti-Detecção
+
+O sistema implementa várias técnicas para evitar RECAPTCHA e detecção de bot:
+
+### Técnicas Implementadas
+- **Stealth Mode**: Puppeteer-extra com plugin stealth remove indicadores de automação
+- **Comportamento Humano**:
+  - Movimento aleatório de mouse
+  - Scroll gradual e natural
+  - Delays aleatórios (3-6s entre páginas)
+- **Fingerprinting**: User agents reais, viewports variados, headers completos
+- **Performance**: Bloqueia imagens/fontes para carregamento mais rápido
+
+### Recomendações
+- ✅ Máximo 50-100 contatos por execução
+- ✅ Aguardar 15-30 minutos entre buscas
+- ✅ Variar nichos e regiões
+- ❌ Não fazer requisições em massa
+
+📖 **Veja detalhes completos em [ANTI_DETECTION.md](./ANTI_DETECTION.md)**
+
 ## Observações Importantes
 
-- O scraping pode levar alguns minutos dependendo da quantidade solicitada
+- O scraping pode levar mais tempo (~8-12s por página) devido ao comportamento humano simulado
 - O Google Maps pode ter limitações de taxa (rate limiting)
 - Alguns estabelecimentos podem não ter telefone público disponível
 - Recomenda-se usar com moderação para evitar bloqueios
+- ⚠️ **O tempo de extração aumentou para ser mais seguro e evitar detecção**
 
 ## Limitações
 

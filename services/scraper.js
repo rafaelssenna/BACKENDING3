@@ -1,23 +1,148 @@
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const BlockResourcesPlugin = require('puppeteer-extra-plugin-block-resources');
+const UserAgent = require('user-agents');
 
+// Adiciona plugin de stealth para evitar detecção
+puppeteer.use(StealthPlugin());
+
+// Bloqueia recursos desnecessários para melhor performance
+puppeteer.use(
+  BlockResourcesPlugin({
+    blockedTypes: new Set(['image', 'font', 'media']),
+  })
+);
+
+// Função para delay aleatório (simula comportamento humano)
+const randomDelay = (min = 1000, max = 3000) => {
+  const delay = Math.floor(Math.random() * (max - min + 1)) + min;
+  return new Promise(resolve => setTimeout(resolve, delay));
+};
+
+// Função para simular movimento de mouse humano
+async function humanMouseMovement(page) {
+  const width = await page.evaluate(() => window.innerWidth);
+  const height = await page.evaluate(() => window.innerHeight);
+
+  const x = Math.floor(Math.random() * width);
+  const y = Math.floor(Math.random() * height);
+
+  await page.mouse.move(x, y, { steps: 10 });
+}
+
+// Função para scroll humano
+async function humanScroll(page) {
+  await page.evaluate(async () => {
+    await new Promise((resolve) => {
+      let totalHeight = 0;
+      const distance = Math.floor(Math.random() * 100) + 100; // 100-200px por vez
+      const timer = setInterval(() => {
+        const scrollHeight = document.body.scrollHeight;
+        window.scrollBy(0, distance);
+        totalHeight += distance;
+
+        if (totalHeight >= scrollHeight / 2) {
+          clearInterval(timer);
+          resolve();
+        }
+      }, Math.floor(Math.random() * 100) + 100); // 100-200ms entre scrolls
+    });
+  });
+}
+
+// Viewports realistas (resoluções comuns)
+const viewports = [
+  { width: 1920, height: 1080 },
+  { width: 1366, height: 768 },
+  { width: 1536, height: 864 },
+  { width: 1440, height: 900 },
+  { width: 1280, height: 720 },
+];
+
+// Função principal de extração
 async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProgress) {
   let browser;
 
   try {
-    onProgress({ status: 'Iniciando...', percent: 5 });
+    onProgress({ status: 'Iniciando navegador...', percent: 5 });
+
+    // Gera user agent realista
+    const userAgent = new UserAgent();
+    const viewport = viewports[Math.floor(Math.random() * viewports.length)];
 
     browser = await puppeteer.launch({
       headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--disable-web-security',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--lang=pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+      ],
     });
 
     const page = await browser.newPage();
-    const query = `${nicho} ${regiao}`;
 
+    // Configura viewport aleatório
+    await page.setViewport(viewport);
+
+    // Define user agent realista
+    await page.setUserAgent(userAgent.toString());
+
+    // Headers adicionais para parecer mais humano
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Upgrade-Insecure-Requests': '1',
+      'Cache-Control': 'max-age=0',
+      'DNT': '1',
+    });
+
+    // Remove indicadores de automação
+    await page.evaluateOnNewDocument(() => {
+      // Sobrescreve webdriver
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+      });
+
+      // Sobrescreve plugins
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5],
+      });
+
+      // Sobrescreve languages
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['pt-BR', 'pt', 'en-US', 'en'],
+      });
+
+      // Chrome específico
+      window.chrome = {
+        runtime: {},
+      };
+
+      // Permissions
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+    });
+
+    const query = `${nicho} ${regiao}`;
     const uniqueEstabelecimentos = new Map();
     let currentPageNum = 0;
     const maxPages = 50;
     let paginasVaziasSeguidas = 0;
+
+    onProgress({ status: 'Configurado! Iniciando busca...', percent: 10 });
 
     while (uniqueEstabelecimentos.size < quantidade && currentPageNum < maxPages) {
       const start = currentPageNum * 10;
@@ -29,8 +154,20 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         percent: 10 + Math.floor((currentPageNum / maxPages) * 20)
       });
 
-      await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
-      await new Promise(r => setTimeout(r, 2000));
+      // Navega com timeout maior
+      await page.goto(url, {
+        waitUntil: 'networkidle2',
+        timeout: 45000
+      });
+
+      // Delay aleatório após carregar
+      await randomDelay(2000, 4000);
+
+      // Simula comportamento humano
+      await humanMouseMovement(page);
+      await randomDelay(500, 1500);
+      await humanScroll(page);
+      await randomDelay(1000, 2000);
 
       // Extrai estabelecimentos da página atual
       const estabelecimentosDaPagina = await page.evaluate(() => {
@@ -123,6 +260,9 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
 
       const percentComplete = Math.min(100, Math.floor((uniqueEstabelecimentos.size / quantidade) * 100));
       console.log(`Progresso: ${percentComplete}% (${uniqueEstabelecimentos.size}/${quantidade})`);
+
+      // Delay aleatório entre páginas (importante!)
+      await randomDelay(3000, 6000);
     }
 
     const unique = Array.from(uniqueEstabelecimentos.values());
@@ -138,7 +278,7 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         percent: 35
       });
       console.log(`⚠️ Solicitado: ${quantidade}, Encontrado: ${unique.length}`);
-      await new Promise(r => setTimeout(r, 2000));
+      await randomDelay(1000, 2000);
     }
 
     onProgress({ status: 'Enviando contatos...', percent: 40 });
@@ -161,7 +301,7 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
       });
 
       console.log(`✓ [${i + 1}] ${est.nome} - ${est.telefone}`);
-      await new Promise(r => setTimeout(r, 30));
+      await randomDelay(20, 50);
     }
 
     onProgress({ status: 'Concluído!', percent: 100 });
@@ -171,7 +311,10 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
     console.error('Erro:', error);
     throw new Error(`Erro: ${error.message}`);
   } finally {
-    if (browser) await browser.close();
+    if (browser) {
+      await randomDelay(1000, 2000);
+      await browser.close();
+    }
   }
 }
 
