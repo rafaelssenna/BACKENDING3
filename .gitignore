@@ -28,3 +28,7 @@ build/
 
 # Puppeteer
 .local-chromium/
+
+# Test files
+test-*.js
+nul
