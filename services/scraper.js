@@ -106,6 +106,14 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         }
       } else {
         paginasVaziasSeguidas = 0; // Reseta contador
+
+        // Conta quantos são NOVOS (não duplicatas de páginas anteriores)
+        const antes = allEstabelecimentos.length;
+        const seenKeys = new Set(allEstabelecimentos.map(e => `${e.nome}|${e.telefone}`));
+        const novos = estabelecimentosDaPagina.filter(e => !seenKeys.has(`${e.nome}|${e.telefone}`));
+
+        console.log(`   → Novos únicos nesta página: ${novos.length} de ${estabelecimentosDaPagina.length}`);
+
         // Adiciona os novos estabelecimentos
         allEstabelecimentos = allEstabelecimentos.concat(estabelecimentosDaPagina);
         console.log(`Total acumulado: ${allEstabelecimentos.length} estabelecimentos`);
