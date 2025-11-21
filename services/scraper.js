@@ -36,64 +36,56 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
       // Extrai estabelecimentos da página atual
       const estabelecimentosDaPagina = await page.evaluate(() => {
         const results = [];
+        const seen = new Set(); // Remove duplicatas DENTRO da mesma página
 
-        // Tenta múltiplos seletores para garantir que pegue todos os cards
-        const selectors = [
-          'div[jscontroller]',
-          'div[data-ved]',
-          'div.VkpGBb',
-          'div[jsname]'
-        ];
+        // Seletor específico para cards de estabelecimentos
+        const cards = document.querySelectorAll('div[jscontroller]');
 
-        let allCards = new Set();
-        selectors.forEach(selector => {
-          const elements = document.querySelectorAll(selector);
-          elements.forEach(el => allCards.add(el));
-        });
-
-        allCards.forEach(card => {
+        cards.forEach(card => {
           const text = card.textContent || '';
 
-          // Busca nome com múltiplos seletores
-          const headingSelectors = [
-            'div[role="heading"]',
-            'h3',
-            'h2',
-            'div.dbg0pd',
-            'span[class*="fontHeadline"]'
-          ];
-
+          // Busca nome - usa div[role="heading"] que é o mais confiável
+          const headings = card.querySelectorAll('div[role="heading"]');
           let nome = '';
-          for (const selector of headingSelectors) {
-            const heading = card.querySelector(selector);
-            if (heading && heading.textContent.trim()) {
-              nome = heading.textContent.trim();
-              break;
-            }
+          if (headings.length > 0) {
+            nome = headings[0].textContent.trim();
           }
 
-          // Busca telefone com regex melhorado - aceita mais formatos
+          // Busca telefone com TODOS os padrões possíveis
           const phonePatterns = [
-            /\(\d{2}\)\s?\d{4,5}-?\d{4}/g,           // (11) 98765-4321
-            /\d{2}\s?\d{4,5}-?\d{4}/g,                // 11 98765-4321
-            /\+55\s?\d{2}\s?\d{4,5}-?\d{4}/g,        // +55 11 98765-4321
-            /\(\d{2}\)\s?\d{8,9}/g                    // (11) 987654321
+            /\(\d{2}\)\s?\d{4,5}[-\s]?\d{4}/g,       // (11) 98765-4321 ou (11) 98765 4321
+            /\d{2}\s?\d{4,5}[-\s]?\d{4}/g,           // 11 98765-4321 ou 11 98765 4321
+            /\+55\s?\(?\d{2}\)?\s?\d{4,5}[-\s]?\d{4}/g, // +55 (11) 98765-4321
+            /\(\d{2}\)\s?\d{8,9}/g,                   // (11) 987654321
+            /\d{10,11}/g                              // 11987654321
           ];
 
           let telefone = null;
           for (const pattern of phonePatterns) {
-            const match = text.match(pattern);
-            if (match) {
-              telefone = match[0];
+            const matches = text.match(pattern);
+            if (matches && matches.length > 0) {
+              // Pega o primeiro match válido
+              telefone = matches[0];
               break;
             }
           }
 
+          // Valida se é realmente um estabelecimento
           if (nome && telefone && nome.length > 3 && nome.length < 150) {
-            results.push({
-              nome: nome,
-              telefone: telefone
-            });
+            // Verifica se não é lixo (menus, botões, etc)
+            const temPalavrasInvalidas = /^(Ver mais|Pesquisar|Filtrar|Mapa|Lista|Anterior|Próxim)/i.test(nome);
+
+            if (!temPalavrasInvalidas) {
+              // Verifica duplicata na mesma página
+              const key = `${nome}|${telefone}`;
+              if (!seen.has(key)) {
+                seen.add(key);
+                results.push({
+                  nome: nome,
+                  telefone: telefone
+                });
+              }
+            }
           }
         });
 
