@@ -15,18 +15,67 @@ puppeteer.use(
   })
 );
 
-// Configurações (podem ser sobrescritas por variáveis de ambiente)
+// Configurações OTIMIZADAS (rápido mas seguro)
 const CONFIG = {
-  headless: process.env.HEADLESS !== 'false', // false = navegador visível (MUITO mais difícil de detectar)
-  minPageDelay: parseInt(process.env.MIN_PAGE_DELAY) || 5000, // Aumentado para 5-10s
-  maxPageDelay: parseInt(process.env.MAX_PAGE_DELAY) || 10000,
-  navigationTimeout: parseInt(process.env.NAVIGATION_TIMEOUT) || 60000,
+  headless: process.env.HEADLESS !== 'false', // false = navegador visível
+  minPageDelay: parseInt(process.env.MIN_PAGE_DELAY) || 2000, // Reduzido: 2-4s
+  maxPageDelay: parseInt(process.env.MAX_PAGE_DELAY) || 4000,
+  navigationTimeout: parseInt(process.env.NAVIGATION_TIMEOUT) || 45000,
   maxPages: parseInt(process.env.MAX_PAGES) || 50,
   proxyUrl: process.env.PROXY_URL || null,
   cookiesPath: path.join(__dirname, '../.cookies.json'),
 };
 
-// Função para delay aleatório (simula comportamento humano)
+// Sistema de delays adaptativos (acelera se estiver indo bem)
+class AdaptiveDelayManager {
+  constructor() {
+    this.successfulPages = 0;
+    this.consecutiveEmptyPages = 0;
+    this.baseMinDelay = CONFIG.minPageDelay;
+    this.baseMaxDelay = CONFIG.maxPageDelay;
+  }
+
+  // Calcula delay baseado no histórico
+  getDelay() {
+    let minDelay = this.baseMinDelay;
+    let maxDelay = this.baseMaxDelay;
+
+    // Primeiras 2 páginas: mais cauteloso
+    if (this.successfulPages < 2) {
+      minDelay = 3000;
+      maxDelay = 5000;
+    }
+    // Páginas 3-5: moderado
+    else if (this.successfulPages < 5) {
+      minDelay = 2500;
+      maxDelay = 4000;
+    }
+    // Depois de 5 páginas bem-sucedidas: pode acelerar
+    else if (this.successfulPages >= 5) {
+      minDelay = 2000;
+      maxDelay = 3500;
+    }
+
+    // Se muitas páginas vazias seguidas: desacelera
+    if (this.consecutiveEmptyPages >= 2) {
+      minDelay += 1000;
+      maxDelay += 2000;
+    }
+
+    return Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
+  }
+
+  recordSuccess() {
+    this.successfulPages++;
+    this.consecutiveEmptyPages = 0;
+  }
+
+  recordEmpty() {
+    this.consecutiveEmptyPages++;
+  }
+}
+
+// Função para delay aleatório
 const randomDelay = (min = 1000, max = 3000) => {
   const delay = Math.floor(Math.random() * (max - min + 1)) + min;
   return new Promise(resolve => setTimeout(resolve, delay));
@@ -49,7 +98,7 @@ async function loadCookies(page) {
     if (fs.existsSync(CONFIG.cookiesPath)) {
       const cookies = JSON.parse(fs.readFileSync(CONFIG.cookiesPath, 'utf8'));
       await page.setCookie(...cookies);
-      console.log('✓ Cookies carregados');
+      console.log('✓ Cookies carregados (sessão reutilizada)');
       return true;
     }
   } catch (error) {
@@ -62,7 +111,6 @@ async function loadCookies(page) {
 async function detectRecaptcha(page) {
   try {
     const hasRecaptcha = await page.evaluate(() => {
-      // Verifica vários indicadores de RECAPTCHA
       const recaptchaDiv = document.querySelector('iframe[src*="recaptcha"]');
       const recaptchaText = document.body.innerText.toLowerCase();
 
@@ -81,75 +129,57 @@ async function detectRecaptcha(page) {
   }
 }
 
-// Função para simular movimento de mouse humano - MELHORADO
+// Movimento de mouse OTIMIZADO (mais rápido)
 async function humanMouseMovement(page) {
   try {
     const width = await page.evaluate(() => window.innerWidth);
     const height = await page.evaluate(() => window.innerHeight);
 
-    // Faz vários movimentos de mouse, não apenas um
-    const numMovements = Math.floor(Math.random() * 3) + 2; // 2-4 movimentos
+    // 1-2 movimentos (reduzido de 2-4)
+    const numMovements = Math.random() > 0.5 ? 2 : 1;
 
     for (let i = 0; i < numMovements; i++) {
       const x = Math.floor(Math.random() * width);
       const y = Math.floor(Math.random() * height);
 
-      await page.mouse.move(x, y, { steps: Math.floor(Math.random() * 20) + 10 });
-      await randomDelay(200, 800);
+      await page.mouse.move(x, y, { steps: Math.floor(Math.random() * 10) + 5 });
+      if (i < numMovements - 1) {
+        await randomDelay(100, 300); // Reduzido de 200-800
+      }
     }
   } catch (error) {
-    console.log('⚠️ Erro no movimento de mouse:', error.message);
+    // Ignora erros
   }
 }
 
-// Função para scroll humano - MELHORADO
+// Scroll OTIMIZADO (mais rápido)
 async function humanScroll(page) {
   try {
     await page.evaluate(async () => {
       await new Promise((resolve) => {
         let totalHeight = 0;
-        const distance = Math.floor(Math.random() * 150) + 100; // 100-250px por vez
-        const maxScroll = Math.random() * document.body.scrollHeight * 0.7; // Scroll até 70% da página
+        const distance = Math.floor(Math.random() * 200) + 150; // Maior distância por vez
+        const maxScroll = Math.random() * document.body.scrollHeight * 0.5; // Menos scroll
 
         const timer = setInterval(() => {
           window.scrollBy(0, distance);
           totalHeight += distance;
 
           if (totalHeight >= maxScroll) {
-            // Scroll de volta para cima um pouco (comportamento humano)
-            window.scrollBy(0, -Math.floor(Math.random() * 300) - 100);
+            // Scroll rápido de volta
+            window.scrollBy(0, -Math.floor(Math.random() * 200) - 100);
             clearInterval(timer);
             resolve();
           }
-        }, Math.floor(Math.random() * 150) + 100); // 100-250ms entre scrolls
+        }, Math.floor(Math.random() * 80) + 50); // Mais rápido: 50-130ms
       });
     });
   } catch (error) {
-    console.log('⚠️ Erro no scroll:', error.message);
+    // Ignora erros
   }
 }
 
-// Cliques aleatórios na página (NÃO em links, só para parecer humano)
-async function randomClicks(page) {
-  try {
-    const numClicks = Math.random() > 0.7 ? 1 : 0; // 30% de chance de clicar
-
-    for (let i = 0; i < numClicks; i++) {
-      const width = await page.evaluate(() => window.innerWidth);
-      const height = await page.evaluate(() => window.innerHeight);
-
-      const x = Math.floor(Math.random() * width * 0.8); // Evita bordas
-      const y = Math.floor(Math.random() * height * 0.5); // Clica na parte superior
-
-      await page.mouse.click(x, y, { delay: Math.floor(Math.random() * 100) + 50 });
-      await randomDelay(500, 1500);
-    }
-  } catch (error) {
-    // Ignorar erros de clique
-  }
-}
-
-// Viewports realistas (resoluções comuns)
+// Viewports realistas
 const viewports = [
   { width: 1920, height: 1080 },
   { width: 1366, height: 768 },
@@ -161,6 +191,7 @@ const viewports = [
 // Função principal de extração
 async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProgress) {
   let browser;
+  const delayManager = new AdaptiveDelayManager();
 
   try {
     onProgress({ status: 'Iniciando navegador...', percent: 5 });
@@ -196,13 +227,13 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
     }
 
     console.log(`🌐 Modo: ${CONFIG.headless ? 'Headless' : 'Navegador Visível'}`);
+    console.log(`⚡ Delays adaptativos: 2-5s (acelera se seguro)`);
 
     browser = await puppeteer.launch(launchOptions);
-
     const page = await browser.newPage();
 
-    // Carrega cookies da sessão anterior (se houver)
-    await loadCookies(page);
+    // Carrega cookies da sessão anterior
+    const hasOldSession = await loadCookies(page);
 
     // Configura viewport aleatório
     await page.setViewport(viewport);
@@ -210,7 +241,7 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
     // Define user agent realista
     await page.setUserAgent(userAgent.toString());
 
-    // Headers adicionais para parecer mais humano
+    // Headers adicionais
     await page.setExtraHTTPHeaders({
       'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
@@ -221,24 +252,20 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
       'Connection': 'keep-alive',
     });
 
-    // Remove indicadores de automação - MELHORADO
+    // Remove indicadores de automação
     await page.evaluateOnNewDocument(() => {
-      // Sobrescreve webdriver
       Object.defineProperty(navigator, 'webdriver', {
         get: () => undefined,
       });
 
-      // Sobrescreve plugins
       Object.defineProperty(navigator, 'plugins', {
         get: () => [1, 2, 3, 4, 5],
       });
 
-      // Sobrescreve languages
       Object.defineProperty(navigator, 'languages', {
         get: () => ['pt-BR', 'pt', 'en-US', 'en'],
       });
 
-      // Chrome específico
       window.chrome = {
         runtime: {},
         loadTimes: function() {},
@@ -246,7 +273,6 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         app: {},
       };
 
-      // Permissions
       const originalQuery = window.navigator.permissions.query;
       window.navigator.permissions.query = (parameters) => (
         parameters.name === 'notifications' ?
@@ -254,12 +280,10 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
           originalQuery(parameters)
       );
 
-      // Hardware concurrency
       Object.defineProperty(navigator, 'hardwareConcurrency', {
         get: () => 8,
       });
 
-      // Device memory
       Object.defineProperty(navigator, 'deviceMemory', {
         get: () => 8,
       });
@@ -272,91 +296,84 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
 
     onProgress({ status: 'Configurado! Iniciando busca...', percent: 10 });
 
-    // Primeiro acesso ao Google (estabelece sessão)
-    console.log('🌐 Estabelecendo sessão com Google...');
-    await page.goto('https://www.google.com.br', {
-      waitUntil: 'networkidle2',
-      timeout: CONFIG.navigationTimeout
-    });
-
-    await randomDelay(2000, 4000);
-    await humanMouseMovement(page);
-    await randomDelay(1000, 2000);
+    // Se não tem sessão antiga, estabelece uma rapidamente
+    if (!hasOldSession) {
+      console.log('🌐 Estabelecendo sessão rápida...');
+      await page.goto('https://www.google.com.br', {
+        waitUntil: 'domcontentloaded', // Mais rápido que networkidle2
+        timeout: CONFIG.navigationTimeout
+      });
+      await randomDelay(1000, 2000); // Rápido
+      await humanMouseMovement(page);
+    }
 
     while (uniqueEstabelecimentos.size < quantidade && currentPageNum < CONFIG.maxPages) {
       const start = currentPageNum * 10;
       const url = `https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q=${encodeURIComponent(query)}&start=${start}`;
 
-      console.log(`\n📄 Acessando página ${currentPageNum + 1}/${CONFIG.maxPages}`);
+      console.log(`\n📄 Página ${currentPageNum + 1}/${CONFIG.maxPages}`);
       onProgress({
         status: `Buscando página ${currentPageNum + 1}...`,
         percent: 10 + Math.floor((currentPageNum / CONFIG.maxPages) * 20)
       });
 
-      // Navega com timeout maior
+      // Navega (networkidle2 garante carregamento completo)
       await page.goto(url, {
         waitUntil: 'networkidle2',
         timeout: CONFIG.navigationTimeout
       });
 
-      // VERIFICA SE TEM RECAPTCHA
+      // VERIFICA RECAPTCHA
       const hasRecaptcha = await detectRecaptcha(page);
 
       if (hasRecaptcha) {
         console.error('🚨 RECAPTCHA DETECTADO!');
 
-        // Salva screenshot para debug
         try {
           await page.screenshot({ path: 'recaptcha-detected.png' });
           console.log('📸 Screenshot salvo: recaptcha-detected.png');
         } catch (e) {}
 
-        throw new Error('RECAPTCHA detectado! Recomendações:\n' +
-          '1. Aguarde 1-2 horas antes de tentar novamente\n' +
-          '2. Troque seu IP (reinicie o roteador)\n' +
-          '3. Use um proxy (configure PROXY_URL no .env)\n' +
-          '4. Reduza a quantidade de contatos\n' +
-          '5. Configure HEADLESS=false no .env para usar navegador visível');
+        throw new Error('❌ RECAPTCHA detectado!\n\n' +
+          '📋 SOLUÇÕES:\n' +
+          '1. ⏰ Aguarde 1-2 horas\n' +
+          '2. 🔄 Troque seu IP (reinicie roteador)\n' +
+          '3. 🌐 Use proxy (configure PROXY_URL no .env)\n' +
+          '4. 🖥️ Configure HEADLESS=false no .env\n' +
+          '5. 📉 Peça menos contatos (10-20)\n\n' +
+          '📖 Veja: SOLUCAO_RECAPTCHA.md');
       }
 
-      // Delay aleatório após carregar - AUMENTADO
-      await randomDelay(3000, 5000);
+      // Delay pós-carregamento REDUZIDO
+      await randomDelay(1500, 2500);
 
-      // Simula comportamento humano - MELHORADO
+      // Comportamento humano OTIMIZADO
       await humanMouseMovement(page);
-      await randomDelay(800, 1500);
+      await randomDelay(300, 600);
       await humanScroll(page);
-      await randomDelay(1000, 2000);
-      await randomClicks(page);
       await randomDelay(500, 1000);
 
-      // Extrai estabelecimentos da página atual
+      // Extrai estabelecimentos
       const estabelecimentosDaPagina = await page.evaluate(() => {
         const results = [];
         const seen = new Set();
-
-        // Pega TODOS os divs com jscontroller
         const cards = document.querySelectorAll('div[jscontroller]');
 
         cards.forEach(card => {
           const text = card.textContent || '';
 
-          // Busca nome
           const headings = card.querySelectorAll('div[role="heading"]');
           let nome = '';
           if (headings.length > 0) {
             nome = headings[0].textContent.trim();
           }
 
-          // Se não tem nome, pula
           if (!nome || nome.length < 3 || nome.length > 150) return;
 
-          // Filtra lixo
           if (/^(Ver mais|Pesquisar|Filtrar|Mapa|Lista|Anterior|Próxim|Direções|Salvar|Escolha)/i.test(nome)) {
             return;
           }
 
-          // Busca telefone com TODAS as variações
           const phonePatterns = [
             /\(\d{2}\)\s?\d{4,5}[-\s]?\d{4}/g,
             /\d{2}\s?\d{4,5}[-\s]?\d{4}/g,
@@ -374,7 +391,6 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
             }
           }
 
-          // Só adiciona se tem telefone
           if (telefone) {
             const key = `${nome}|${telefone}`;
             if (!seen.has(key)) {
@@ -391,14 +407,16 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
 
       if (estabelecimentosDaPagina.length === 0) {
         paginasVaziasSeguidas++;
+        delayManager.recordEmpty();
+
         if (paginasVaziasSeguidas >= 5) {
-          console.log('⚠️ Encerrando busca - 5 páginas vazias seguidas');
+          console.log('⚠️ Encerrando - 5 páginas vazias seguidas');
           break;
         }
       } else {
         paginasVaziasSeguidas = 0;
+        delayManager.recordSuccess();
 
-        // Adiciona novos únicos
         let novosAdicionados = 0;
         estabelecimentosDaPagina.forEach(est => {
           const key = `${est.nome}|${est.telefone}`;
@@ -409,7 +427,7 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         });
 
         console.log(`   ➕ Novos únicos: ${novosAdicionados}`);
-        console.log(`   📊 Total único até agora: ${uniqueEstabelecimentos.size}/${quantidade}`);
+        console.log(`   📊 Total: ${uniqueEstabelecimentos.size}/${quantidade}`);
       }
 
       currentPageNum++;
@@ -419,22 +437,20 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         break;
       }
 
-      const percentComplete = Math.min(100, Math.floor((uniqueEstabelecimentos.size / quantidade) * 100));
-
-      // Delay aleatório entre páginas - MUITO IMPORTANTE E AUMENTADO!
-      const pageDelay = Math.floor(Math.random() * (CONFIG.maxPageDelay - CONFIG.minPageDelay + 1)) + CONFIG.minPageDelay;
-      console.log(`   ⏳ Aguardando ${(pageDelay / 1000).toFixed(1)}s antes da próxima página...`);
-      await randomDelay(pageDelay, pageDelay + 1000);
+      // Delay adaptativo entre páginas
+      const pageDelay = delayManager.getDelay();
+      console.log(`   ⏳ Aguardando ${(pageDelay / 1000).toFixed(1)}s...`);
+      await randomDelay(pageDelay, pageDelay + 500);
     }
 
-    // Salva cookies para próxima sessão
+    // Salva cookies
     await saveCookies(page);
 
     const unique = Array.from(uniqueEstabelecimentos.values());
-    console.log(`\n✅ Total coletado: ${unique.length} estabelecimentos únicos (${currentPageNum} páginas)`);
+    console.log(`\n✅ Total: ${unique.length} estabelecimentos (${currentPageNum} páginas)`);
 
     if (unique.length === 0) {
-      throw new Error('Nenhum resultado encontrado. O Google pode ter mudado a estrutura HTML.');
+      throw new Error('Nenhum resultado encontrado. Tente outro nicho/região.');
     }
 
     if (unique.length < quantidade) {
@@ -442,8 +458,8 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         status: `Encontrados ${unique.length} de ${quantidade} solicitados.`,
         percent: 35
       });
-      console.log(`⚠️ Solicitado: ${quantidade}, Encontrado: ${unique.length}`);
-      await randomDelay(1000, 2000);
+      console.log(`⚠️ Encontrado: ${unique.length}/${quantidade}`);
+      await randomDelay(1000, 1500);
     }
 
     onProgress({ status: 'Enviando contatos...', percent: 40 });
@@ -466,18 +482,18 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
       });
 
       console.log(`   ✓ [${i + 1}/${limit}] ${est.nome} - ${est.telefone}`);
-      await randomDelay(20, 50);
+      await randomDelay(15, 40);
     }
 
     onProgress({ status: 'Concluído!', percent: 100 });
-    console.log(`\n🎉 Total enviado: ${limit} contatos`);
+    console.log(`\n🎉 Enviado: ${limit} contatos`);
 
   } catch (error) {
     console.error('❌ Erro:', error.message);
     throw error;
   } finally {
     if (browser) {
-      await randomDelay(1000, 2000);
+      await randomDelay(500, 1000);
       await browser.close();
     }
   }

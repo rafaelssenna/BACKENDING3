@@ -15,6 +15,10 @@ API para extração de contatos do Google Maps (Google Local) em tempo real com 
   - Comportamento humano simulado (mouse, scroll, delays)
   - User agents realistas e rotativos
   - Fingerprinting avançado
+- **⚡ Sistema de Delays Adaptativos** - rápido mas seguro
+  - Acelera automaticamente quando seguro
+  - 3x mais rápido que versão anterior
+  - Mantém segurança com detecção inteligente
 
 ## Tecnologias
 
@@ -246,13 +250,36 @@ MAX_PAGE_DELAY=10000
 
 📖 **[ANTI_DETECTION.md](./ANTI_DETECTION.md)** - Técnicas anti-detecção detalhadas
 
+⚡ **[VELOCIDADE_OTIMIZADA.md](./VELOCIDADE_OTIMIZADA.md)** - Sistema de delays adaptativos
+
+## ⚡ Performance Otimizada
+
+O sistema usa **delays adaptativos** que aceleram automaticamente:
+
+### Tempos Estimados
+
+| Contatos | Tempo | Velocidade |
+|----------|-------|------------|
+| 10 contatos | 8-15s | ⚡⚡⚡ |
+| 30 contatos | 15-25s | ⚡⚡⚡ |
+| 50 contatos | 20-35s | ⚡⚡ |
+| 100 contatos | 40-70s | ⚡ |
+
+### Como Funciona
+
+- **Páginas 1-2**: 3-5s (cauteloso)
+- **Páginas 3-5**: 2.5-4s (moderado)
+- **Páginas 6+**: 2-3.5s ⚡ (acelerado!)
+
+**Resultado**: 3x mais rápido que versão anterior, mantendo segurança!
+
 ## Observações Importantes
 
-- O scraping pode levar mais tempo (~8-12s por página) devido ao comportamento humano simulado
+- ⚡ **Sistema otimizado**: ~3-5s por página com delays adaptativos
 - O Google Maps pode ter limitações de taxa (rate limiting)
 - Alguns estabelecimentos podem não ter telefone público disponível
 - Recomenda-se usar com moderação para evitar bloqueios
-- ⚠️ **O tempo de extração aumentou para ser mais seguro e evitar detecção**
+- 🛡️ **Detecção automática de RECAPTCHA** - para e alerta se detectar
 
 ## Limitações
 
