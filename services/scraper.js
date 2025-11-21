@@ -14,13 +14,14 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
     const page = await browser.newPage();
     const query = `${nicho} ${regiao}`;
 
-    let allEstabelecimentos = [];
+    const uniqueEstabelecimentos = new Map(); // Armazena únicos por chave nome|telefone
     let currentPage = 0;
     const maxPages = 50; // Aumentado para garantir busca completa
     let paginasVaziasSeguidas = 0;
+    let paginasSemNovos = 0; // Conta páginas que não trouxeram nenhum novo único
 
-    // Continua buscando até ter leads suficientes
-    while (allEstabelecimentos.length < quantidade && currentPage < maxPages) {
+    // Continua buscando até ter leads ÚNICOS suficientes
+    while (uniqueEstabelecimentos.size < quantidade && currentPage < maxPages) {
       const start = currentPage * 10; // Google usa start=0, 10, 20, 30...
       const url = `https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q=${encodeURIComponent(query)}&start=${start}`;
 
@@ -107,44 +108,48 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
       } else {
         paginasVaziasSeguidas = 0; // Reseta contador
 
-        // Conta quantos são NOVOS (não duplicatas de páginas anteriores)
-        const antes = allEstabelecimentos.length;
-        const seenKeys = new Set(allEstabelecimentos.map(e => `${e.nome}|${e.telefone}`));
-        const novos = estabelecimentosDaPagina.filter(e => !seenKeys.has(`${e.nome}|${e.telefone}`));
+        // Adiciona apenas os NOVOS únicos ao Map
+        let novosAdicionados = 0;
+        estabelecimentosDaPagina.forEach(est => {
+          const key = `${est.nome}|${est.telefone}`;
+          if (!uniqueEstabelecimentos.has(key)) {
+            uniqueEstabelecimentos.set(key, est);
+            novosAdicionados++;
+          }
+        });
 
-        console.log(`   → Novos únicos nesta página: ${novos.length} de ${estabelecimentosDaPagina.length}`);
+        console.log(`   → Novos únicos adicionados: ${novosAdicionados} de ${estabelecimentosDaPagina.length}`);
+        console.log(`   → Total de únicos até agora: ${uniqueEstabelecimentos.size}`);
 
-        // Adiciona os novos estabelecimentos
-        allEstabelecimentos = allEstabelecimentos.concat(estabelecimentosDaPagina);
-        console.log(`Total acumulado: ${allEstabelecimentos.length} estabelecimentos`);
+        // Conta páginas sem novos
+        if (novosAdicionados === 0) {
+          paginasSemNovos++;
+          if (paginasSemNovos >= 3) {
+            console.log('Encerrando busca - 3 páginas seguidas sem novos únicos');
+            break;
+          }
+        } else {
+          paginasSemNovos = 0;
+        }
       }
 
       currentPage++;
 
-      // Se já temos o suficiente, para
-      if (allEstabelecimentos.length >= quantidade) {
-        console.log(`✓ Quantidade atingida: ${allEstabelecimentos.length} >= ${quantidade}`);
+      // Se já temos únicos suficientes, para
+      if (uniqueEstabelecimentos.size >= quantidade) {
+        console.log(`✓ Quantidade de únicos atingida: ${uniqueEstabelecimentos.size} >= ${quantidade}`);
         break;
       }
 
-      // Log de progresso
-      const percentComplete = Math.min(100, Math.floor((allEstabelecimentos.length / quantidade) * 100));
-      console.log(`Progresso: ${percentComplete}% (${allEstabelecimentos.length}/${quantidade})`);
+      // Log de progresso baseado em únicos
+      const percentComplete = Math.min(100, Math.floor((uniqueEstabelecimentos.size / quantidade) * 100));
+      console.log(`Progresso: ${percentComplete}% (${uniqueEstabelecimentos.size}/${quantidade})`);
     }
 
-    // Remove duplicatas de todas as páginas
-    const unique = [];
-    const seen = new Set();
+    // Converte Map para array
+    const unique = Array.from(uniqueEstabelecimentos.values());
 
-    allEstabelecimentos.forEach(item => {
-      const key = `${item.nome}|${item.telefone}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        unique.push(item);
-      }
-    });
-
-    console.log(`Total coletado: ${unique.length} estabelecimentos (${currentPage} páginas)`);
+    console.log(`Total coletado: ${unique.length} estabelecimentos únicos (${currentPage} páginas)`);
 
     if (unique.length === 0) {
       throw new Error('Nenhum resultado encontrado');
