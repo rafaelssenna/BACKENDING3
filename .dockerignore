@@ -3,8 +3,6 @@ npm-debug.log
 .env
 .git
 .gitignore
-README.md
 .vscode
 test-*.js
-*.md
 .claude
