@@ -38,19 +38,32 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         const results = [];
         const seen = new Set();
 
-        // Pega todos os links principais dos estabelecimentos
-        const allLinks = document.querySelectorAll('a[href*="/maps/place/"]');
+        // Busca por cards de estabelecimentos com nome
+        const cards = document.querySelectorAll('div[jscontroller]');
 
-        allLinks.forEach(link => {
+        cards.forEach(card => {
+          // Busca nome
+          const headings = card.querySelectorAll('div[role="heading"]');
+          if (headings.length === 0) return;
+
+          const nome = headings[0].textContent?.trim();
+          if (!nome || nome.length < 3 || nome.length > 150) return;
+
+          // Filtra lixo
+          if (/^(Ver mais|Pesquisar|Filtrar|Mapa|Lista|Anterior|Próxim|Direções|Salvar|Escolha)/i.test(nome)) {
+            return;
+          }
+
+          // Busca link dentro do card
+          const link = card.querySelector('a[href]');
+          if (!link) return;
+
           const href = link.href;
-          const nome = link.textContent?.trim();
 
-          if (href && nome && nome.length > 3 && nome.length < 150 && !seen.has(href)) {
-            // Filtra lixo
-            if (!/^(Ver mais|Pesquisar|Filtrar|Mapa|Lista|Anterior|Próxim|Direções|Salvar)/i.test(nome)) {
-              seen.add(href);
-              results.push({ nome, href });
-            }
+          // Verifica se é um link válido do Maps
+          if (href && (href.includes('maps') || href.includes('place')) && !seen.has(nome)) {
+            seen.add(nome);
+            results.push({ nome, href });
           }
         });
 
