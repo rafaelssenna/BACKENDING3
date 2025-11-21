@@ -29,6 +29,16 @@ build/
 # Puppeteer
 .local-chromium/
 
+# Cookies e sessões (contém dados sensíveis)
+.cookies.json
+*.cookies.json
+
+# Screenshots de debug (podem conter informações sensíveis)
+*.png
+*.jpg
+*.jpeg
+recaptcha-detected.png
+
 # Test files
 test-*.js
 nul

@@ -172,22 +172,79 @@ npm run dev
 
 O sistema implementa várias técnicas para evitar RECAPTCHA e detecção de bot:
 
+### 🚨 SE VOCÊ ESTÁ COM RECAPTCHA AGORA
+
+**Leia**: [SOLUCAO_RECAPTCHA.md](./SOLUCAO_RECAPTCHA.md) - Guia completo de solução
+
+**Resumo rápido**:
+1. ✋ **PARE** - Aguarde 1-2 horas
+2. 🔄 **TROQUE O IP** - Reinicie roteador ou use proxy
+3. ⚙️ **Configure .env** com `HEADLESS=false`
+4. 🧹 **Limpe cookies**: `rm -f .cookies.json`
+5. 🚀 **Teste com 10 contatos** primeiro
+
 ### Técnicas Implementadas
-- **Stealth Mode**: Puppeteer-extra com plugin stealth remove indicadores de automação
-- **Comportamento Humano**:
-  - Movimento aleatório de mouse
-  - Scroll gradual e natural
-  - Delays aleatórios (3-6s entre páginas)
-- **Fingerprinting**: User agents reais, viewports variados, headers completos
-- **Performance**: Bloqueia imagens/fontes para carregamento mais rápido
 
-### Recomendações
-- ✅ Máximo 50-100 contatos por execução
-- ✅ Aguardar 15-30 minutos entre buscas
+#### ✅ Detecção Automática de RECAPTCHA
+- Detecta e para automaticamente se encontrar RECAPTCHA
+- Salva screenshot para debug
+- Mostra instruções de como resolver
+
+#### ✅ Stealth Mode Avançado
+- Puppeteer-extra com plugin stealth
+- Remove todos indicadores de automação
+- Passa em testes de detecção de bots
+
+#### ✅ Comportamento Humano Realista
+- **Movimento de mouse**: 2-4 movimentos aleatórios por página
+- **Scroll gradual**: Com volta para cima (comportamento humano)
+- **Cliques aleatórios**: 30% de chance de clicar na página
+- **Delays variados**: 5-10s entre páginas (configurável)
+
+#### ✅ Sessões Persistentes
+- Salva cookies em `.cookies.json`
+- Reutiliza sessão (parece usuário retornando)
+- Estabelece sessão no google.com.br primeiro
+
+#### ✅ Suporte a Proxy
+- Configure via variável `PROXY_URL` no .env
+- Suporta HTTP e SOCKS5
+- Essencial se estiver bloqueado
+
+#### ✅ Modo Não-Headless
+- Configure `HEADLESS=false` no .env
+- Navegador visível = muito mais difícil de detectar
+- **Recomendado se estiver enfrentando RECAPTCHA**
+
+### Configuração Anti-RECAPTCHA
+
+Crie arquivo `.env` com:
+
+```bash
+# Navegador visível (mais seguro)
+HEADLESS=false
+
+# Delays aumentados
+MIN_PAGE_DELAY=5000
+MAX_PAGE_DELAY=10000
+
+# Proxy (se tiver)
+# PROXY_URL=http://usuario:senha@proxy.com:8080
+```
+
+### Recomendações de Uso
+- ✅ Máximo 10-30 contatos por execução (se estiver com problemas)
+- ✅ Aguardar 30-60 minutos entre buscas
 - ✅ Variar nichos e regiões
+- ✅ Usar em horários comerciais (9h-18h)
 - ❌ Não fazer requisições em massa
+- ❌ Não repetir mesma busca seguida
 
-📖 **Veja detalhes completos em [ANTI_DETECTION.md](./ANTI_DETECTION.md)**
+### Documentação Completa
+
+📖 **[SOLUCAO_RECAPTCHA.md](./SOLUCAO_RECAPTCHA.md)** - Resolver RECAPTCHA atual
+
+📖 **[ANTI_DETECTION.md](./ANTI_DETECTION.md)** - Técnicas anti-detecção detalhadas
 
 ## Observações Importantes
 

@@ -2,6 +2,8 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const BlockResourcesPlugin = require('puppeteer-extra-plugin-block-resources');
 const UserAgent = require('user-agents');
+const fs = require('fs');
+const path = require('path');
 
 // Adiciona plugin de stealth para evitar detecção
 puppeteer.use(StealthPlugin());
@@ -13,41 +15,138 @@ puppeteer.use(
   })
 );
 
+// Configurações (podem ser sobrescritas por variáveis de ambiente)
+const CONFIG = {
+  headless: process.env.HEADLESS !== 'false', // false = navegador visível (MUITO mais difícil de detectar)
+  minPageDelay: parseInt(process.env.MIN_PAGE_DELAY) || 5000, // Aumentado para 5-10s
+  maxPageDelay: parseInt(process.env.MAX_PAGE_DELAY) || 10000,
+  navigationTimeout: parseInt(process.env.NAVIGATION_TIMEOUT) || 60000,
+  maxPages: parseInt(process.env.MAX_PAGES) || 50,
+  proxyUrl: process.env.PROXY_URL || null,
+  cookiesPath: path.join(__dirname, '../.cookies.json'),
+};
+
 // Função para delay aleatório (simula comportamento humano)
 const randomDelay = (min = 1000, max = 3000) => {
   const delay = Math.floor(Math.random() * (max - min + 1)) + min;
   return new Promise(resolve => setTimeout(resolve, delay));
 };
 
-// Função para simular movimento de mouse humano
-async function humanMouseMovement(page) {
-  const width = await page.evaluate(() => window.innerWidth);
-  const height = await page.evaluate(() => window.innerHeight);
-
-  const x = Math.floor(Math.random() * width);
-  const y = Math.floor(Math.random() * height);
-
-  await page.mouse.move(x, y, { steps: 10 });
+// Salva cookies para reutilizar sessão
+async function saveCookies(page) {
+  try {
+    const cookies = await page.cookies();
+    fs.writeFileSync(CONFIG.cookiesPath, JSON.stringify(cookies, null, 2));
+    console.log('✓ Cookies salvos');
+  } catch (error) {
+    console.log('⚠️ Erro ao salvar cookies:', error.message);
+  }
 }
 
-// Função para scroll humano
-async function humanScroll(page) {
-  await page.evaluate(async () => {
-    await new Promise((resolve) => {
-      let totalHeight = 0;
-      const distance = Math.floor(Math.random() * 100) + 100; // 100-200px por vez
-      const timer = setInterval(() => {
-        const scrollHeight = document.body.scrollHeight;
-        window.scrollBy(0, distance);
-        totalHeight += distance;
+// Carrega cookies salvos
+async function loadCookies(page) {
+  try {
+    if (fs.existsSync(CONFIG.cookiesPath)) {
+      const cookies = JSON.parse(fs.readFileSync(CONFIG.cookiesPath, 'utf8'));
+      await page.setCookie(...cookies);
+      console.log('✓ Cookies carregados');
+      return true;
+    }
+  } catch (error) {
+    console.log('⚠️ Erro ao carregar cookies:', error.message);
+  }
+  return false;
+}
 
-        if (totalHeight >= scrollHeight / 2) {
-          clearInterval(timer);
-          resolve();
-        }
-      }, Math.floor(Math.random() * 100) + 100); // 100-200ms entre scrolls
+// Detecta se há RECAPTCHA na página
+async function detectRecaptcha(page) {
+  try {
+    const hasRecaptcha = await page.evaluate(() => {
+      // Verifica vários indicadores de RECAPTCHA
+      const recaptchaDiv = document.querySelector('iframe[src*="recaptcha"]');
+      const recaptchaText = document.body.innerText.toLowerCase();
+
+      return !!(
+        recaptchaDiv ||
+        recaptchaText.includes('recaptcha') ||
+        recaptchaText.includes('captcha') ||
+        recaptchaText.includes('unusual traffic') ||
+        recaptchaText.includes('tráfego incomum')
+      );
     });
-  });
+
+    return hasRecaptcha;
+  } catch (error) {
+    return false;
+  }
+}
+
+// Função para simular movimento de mouse humano - MELHORADO
+async function humanMouseMovement(page) {
+  try {
+    const width = await page.evaluate(() => window.innerWidth);
+    const height = await page.evaluate(() => window.innerHeight);
+
+    // Faz vários movimentos de mouse, não apenas um
+    const numMovements = Math.floor(Math.random() * 3) + 2; // 2-4 movimentos
+
+    for (let i = 0; i < numMovements; i++) {
+      const x = Math.floor(Math.random() * width);
+      const y = Math.floor(Math.random() * height);
+
+      await page.mouse.move(x, y, { steps: Math.floor(Math.random() * 20) + 10 });
+      await randomDelay(200, 800);
+    }
+  } catch (error) {
+    console.log('⚠️ Erro no movimento de mouse:', error.message);
+  }
+}
+
+// Função para scroll humano - MELHORADO
+async function humanScroll(page) {
+  try {
+    await page.evaluate(async () => {
+      await new Promise((resolve) => {
+        let totalHeight = 0;
+        const distance = Math.floor(Math.random() * 150) + 100; // 100-250px por vez
+        const maxScroll = Math.random() * document.body.scrollHeight * 0.7; // Scroll até 70% da página
+
+        const timer = setInterval(() => {
+          window.scrollBy(0, distance);
+          totalHeight += distance;
+
+          if (totalHeight >= maxScroll) {
+            // Scroll de volta para cima um pouco (comportamento humano)
+            window.scrollBy(0, -Math.floor(Math.random() * 300) - 100);
+            clearInterval(timer);
+            resolve();
+          }
+        }, Math.floor(Math.random() * 150) + 100); // 100-250ms entre scrolls
+      });
+    });
+  } catch (error) {
+    console.log('⚠️ Erro no scroll:', error.message);
+  }
+}
+
+// Cliques aleatórios na página (NÃO em links, só para parecer humano)
+async function randomClicks(page) {
+  try {
+    const numClicks = Math.random() > 0.7 ? 1 : 0; // 30% de chance de clicar
+
+    for (let i = 0; i < numClicks; i++) {
+      const width = await page.evaluate(() => window.innerWidth);
+      const height = await page.evaluate(() => window.innerHeight);
+
+      const x = Math.floor(Math.random() * width * 0.8); // Evita bordas
+      const y = Math.floor(Math.random() * height * 0.5); // Clica na parte superior
+
+      await page.mouse.click(x, y, { delay: Math.floor(Math.random() * 100) + 50 });
+      await randomDelay(500, 1500);
+    }
+  } catch (error) {
+    // Ignorar erros de clique
+  }
 }
 
 // Viewports realistas (resoluções comuns)
@@ -70,8 +169,8 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
     const userAgent = new UserAgent();
     const viewport = viewports[Math.floor(Math.random() * viewports.length)];
 
-    browser = await puppeteer.launch({
-      headless: 'new',
+    const launchOptions = {
+      headless: CONFIG.headless,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -84,10 +183,26 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         '--no-zygote',
         '--disable-gpu',
         '--lang=pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
       ],
-    });
+    };
+
+    // Adiciona proxy se configurado
+    if (CONFIG.proxyUrl) {
+      launchOptions.args.push(`--proxy-server=${CONFIG.proxyUrl}`);
+      console.log(`🔄 Usando proxy: ${CONFIG.proxyUrl}`);
+    }
+
+    console.log(`🌐 Modo: ${CONFIG.headless ? 'Headless' : 'Navegador Visível'}`);
+
+    browser = await puppeteer.launch(launchOptions);
 
     const page = await browser.newPage();
+
+    // Carrega cookies da sessão anterior (se houver)
+    await loadCookies(page);
 
     // Configura viewport aleatório
     await page.setViewport(viewport);
@@ -103,9 +218,10 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
       'Upgrade-Insecure-Requests': '1',
       'Cache-Control': 'max-age=0',
       'DNT': '1',
+      'Connection': 'keep-alive',
     });
 
-    // Remove indicadores de automação
+    // Remove indicadores de automação - MELHORADO
     await page.evaluateOnNewDocument(() => {
       // Sobrescreve webdriver
       Object.defineProperty(navigator, 'webdriver', {
@@ -125,6 +241,9 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
       // Chrome específico
       window.chrome = {
         runtime: {},
+        loadTimes: function() {},
+        csi: function() {},
+        app: {},
       };
 
       // Permissions
@@ -134,40 +253,82 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
           Promise.resolve({ state: Notification.permission }) :
           originalQuery(parameters)
       );
+
+      // Hardware concurrency
+      Object.defineProperty(navigator, 'hardwareConcurrency', {
+        get: () => 8,
+      });
+
+      // Device memory
+      Object.defineProperty(navigator, 'deviceMemory', {
+        get: () => 8,
+      });
     });
 
     const query = `${nicho} ${regiao}`;
     const uniqueEstabelecimentos = new Map();
     let currentPageNum = 0;
-    const maxPages = 50;
     let paginasVaziasSeguidas = 0;
 
     onProgress({ status: 'Configurado! Iniciando busca...', percent: 10 });
 
-    while (uniqueEstabelecimentos.size < quantidade && currentPageNum < maxPages) {
+    // Primeiro acesso ao Google (estabelece sessão)
+    console.log('🌐 Estabelecendo sessão com Google...');
+    await page.goto('https://www.google.com.br', {
+      waitUntil: 'networkidle2',
+      timeout: CONFIG.navigationTimeout
+    });
+
+    await randomDelay(2000, 4000);
+    await humanMouseMovement(page);
+    await randomDelay(1000, 2000);
+
+    while (uniqueEstabelecimentos.size < quantidade && currentPageNum < CONFIG.maxPages) {
       const start = currentPageNum * 10;
       const url = `https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q=${encodeURIComponent(query)}&start=${start}`;
 
-      console.log(`Acessando página ${currentPageNum + 1}: ${url}`);
+      console.log(`\n📄 Acessando página ${currentPageNum + 1}/${CONFIG.maxPages}`);
       onProgress({
         status: `Buscando página ${currentPageNum + 1}...`,
-        percent: 10 + Math.floor((currentPageNum / maxPages) * 20)
+        percent: 10 + Math.floor((currentPageNum / CONFIG.maxPages) * 20)
       });
 
       // Navega com timeout maior
       await page.goto(url, {
         waitUntil: 'networkidle2',
-        timeout: 45000
+        timeout: CONFIG.navigationTimeout
       });
 
-      // Delay aleatório após carregar
-      await randomDelay(2000, 4000);
+      // VERIFICA SE TEM RECAPTCHA
+      const hasRecaptcha = await detectRecaptcha(page);
 
-      // Simula comportamento humano
+      if (hasRecaptcha) {
+        console.error('🚨 RECAPTCHA DETECTADO!');
+
+        // Salva screenshot para debug
+        try {
+          await page.screenshot({ path: 'recaptcha-detected.png' });
+          console.log('📸 Screenshot salvo: recaptcha-detected.png');
+        } catch (e) {}
+
+        throw new Error('RECAPTCHA detectado! Recomendações:\n' +
+          '1. Aguarde 1-2 horas antes de tentar novamente\n' +
+          '2. Troque seu IP (reinicie o roteador)\n' +
+          '3. Use um proxy (configure PROXY_URL no .env)\n' +
+          '4. Reduza a quantidade de contatos\n' +
+          '5. Configure HEADLESS=false no .env para usar navegador visível');
+      }
+
+      // Delay aleatório após carregar - AUMENTADO
+      await randomDelay(3000, 5000);
+
+      // Simula comportamento humano - MELHORADO
       await humanMouseMovement(page);
-      await randomDelay(500, 1500);
+      await randomDelay(800, 1500);
       await humanScroll(page);
       await randomDelay(1000, 2000);
+      await randomClicks(page);
+      await randomDelay(500, 1000);
 
       // Extrai estabelecimentos da página atual
       const estabelecimentosDaPagina = await page.evaluate(() => {
@@ -226,12 +387,12 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         return results;
       });
 
-      console.log(`Página ${currentPageNum + 1}: ${estabelecimentosDaPagina.length} estabelecimentos com telefone`);
+      console.log(`   ✓ Encontrados: ${estabelecimentosDaPagina.length} estabelecimentos`);
 
       if (estabelecimentosDaPagina.length === 0) {
         paginasVaziasSeguidas++;
         if (paginasVaziasSeguidas >= 5) {
-          console.log('Encerrando busca - 5 páginas vazias seguidas');
+          console.log('⚠️ Encerrando busca - 5 páginas vazias seguidas');
           break;
         }
       } else {
@@ -247,34 +408,38 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
           }
         });
 
-        console.log(`   → Novos únicos adicionados: ${novosAdicionados} de ${estabelecimentosDaPagina.length}`);
-        console.log(`   → Total de únicos até agora: ${uniqueEstabelecimentos.size}`);
+        console.log(`   ➕ Novos únicos: ${novosAdicionados}`);
+        console.log(`   📊 Total único até agora: ${uniqueEstabelecimentos.size}/${quantidade}`);
       }
 
       currentPageNum++;
 
       if (uniqueEstabelecimentos.size >= quantidade) {
-        console.log(`✓ Quantidade de únicos atingida: ${uniqueEstabelecimentos.size} >= ${quantidade}`);
+        console.log(`✅ Meta atingida: ${uniqueEstabelecimentos.size} >= ${quantidade}`);
         break;
       }
 
       const percentComplete = Math.min(100, Math.floor((uniqueEstabelecimentos.size / quantidade) * 100));
-      console.log(`Progresso: ${percentComplete}% (${uniqueEstabelecimentos.size}/${quantidade})`);
 
-      // Delay aleatório entre páginas (importante!)
-      await randomDelay(3000, 6000);
+      // Delay aleatório entre páginas - MUITO IMPORTANTE E AUMENTADO!
+      const pageDelay = Math.floor(Math.random() * (CONFIG.maxPageDelay - CONFIG.minPageDelay + 1)) + CONFIG.minPageDelay;
+      console.log(`   ⏳ Aguardando ${(pageDelay / 1000).toFixed(1)}s antes da próxima página...`);
+      await randomDelay(pageDelay, pageDelay + 1000);
     }
 
+    // Salva cookies para próxima sessão
+    await saveCookies(page);
+
     const unique = Array.from(uniqueEstabelecimentos.values());
-    console.log(`Total coletado: ${unique.length} estabelecimentos únicos (${currentPageNum} páginas)`);
+    console.log(`\n✅ Total coletado: ${unique.length} estabelecimentos únicos (${currentPageNum} páginas)`);
 
     if (unique.length === 0) {
-      throw new Error('Nenhum resultado encontrado');
+      throw new Error('Nenhum resultado encontrado. O Google pode ter mudado a estrutura HTML.');
     }
 
     if (unique.length < quantidade) {
       onProgress({
-        status: `Encontrados ${unique.length} contatos de ${quantidade} solicitados.`,
+        status: `Encontrados ${unique.length} de ${quantidade} solicitados.`,
         percent: 35
       });
       console.log(`⚠️ Solicitado: ${quantidade}, Encontrado: ${unique.length}`);
@@ -300,16 +465,16 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         index: i + 1
       });
 
-      console.log(`✓ [${i + 1}] ${est.nome} - ${est.telefone}`);
+      console.log(`   ✓ [${i + 1}/${limit}] ${est.nome} - ${est.telefone}`);
       await randomDelay(20, 50);
     }
 
     onProgress({ status: 'Concluído!', percent: 100 });
-    console.log(`Total enviado: ${limit}`);
+    console.log(`\n🎉 Total enviado: ${limit} contatos`);
 
   } catch (error) {
-    console.error('Erro:', error);
-    throw new Error(`Erro: ${error.message}`);
+    console.error('❌ Erro:', error.message);
+    throw error;
   } finally {
     if (browser) {
       await randomDelay(1000, 2000);
