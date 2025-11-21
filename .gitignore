@@ -32,3 +32,6 @@ build/
 # Test files
 test-*.js
 nul
+
+# Frontend (está em repositório separado)
+public/

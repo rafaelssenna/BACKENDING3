@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: smart-leads-backend
+    env: node
+    buildCommand: npm ci --only=production
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 18
+      - key: PUPPETEER_SKIP_CHROMIUM_DOWNLOAD
+        value: true
+      - key: PUPPETEER_EXECUTABLE_PATH
+        value: /usr/bin/chromium
