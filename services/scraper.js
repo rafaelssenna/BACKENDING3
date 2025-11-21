@@ -97,6 +97,16 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
       throw new Error('Nenhum resultado encontrado');
     }
 
+    // Avisa se encontrou menos do que o solicitado
+    if (unique.length < quantidade) {
+      onProgress({
+        status: `Encontrados apenas ${unique.length} contatos. Não há mais resultados disponíveis.`,
+        percent: 35
+      });
+      console.log(`⚠️ Solicitado: ${quantidade}, Encontrado: ${unique.length}`);
+      await new Promise(r => setTimeout(r, 2000)); // Pausa para usuário ver a mensagem
+    }
+
     onProgress({ status: 'Extraindo contatos...', percent: 40 });
 
     const limit = Math.min(unique.length, quantidade);
