@@ -14,78 +14,42 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
     const page = await browser.newPage();
     const query = `${nicho} ${regiao}`;
 
-    const uniqueEstabelecimentos = new Map(); // Armazena únicos por chave nome|telefone
-    let currentPage = 0;
-    const maxPages = 50; // Aumentado para garantir busca completa
+    const uniqueEstabelecimentos = new Map();
+    let currentPageNum = 0;
+    const maxPages = 50;
     let paginasVaziasSeguidas = 0;
-    let paginasSemNovos = 0; // Conta páginas que não trouxeram nenhum novo único
 
     // Continua buscando até ter leads ÚNICOS suficientes
-    while (uniqueEstabelecimentos.size < quantidade && currentPage < maxPages) {
-      const start = currentPage * 10; // Google usa start=0, 10, 20, 30...
+    while (uniqueEstabelecimentos.size < quantidade && currentPageNum < maxPages) {
+      const start = currentPageNum * 10;
       const url = `https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q=${encodeURIComponent(query)}&start=${start}`;
 
-      console.log(`Acessando página ${currentPage + 1}: ${url}`);
+      console.log(`Acessando página ${currentPageNum + 1}: ${url}`);
       onProgress({
-        status: `Buscando página ${currentPage + 1}...`,
-        percent: 10 + Math.floor((currentPage / maxPages) * 20)
+        status: `Buscando página ${currentPageNum + 1}...`,
+        percent: 10 + Math.floor((currentPageNum / maxPages) * 20)
       });
 
-      await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
-      await new Promise(r => setTimeout(r, 2000));
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+      await new Promise(r => setTimeout(r, 1500));
 
-      // Extrai estabelecimentos da página atual
-      const estabelecimentosDaPagina = await page.evaluate(() => {
+      // Extrai todos os links clicáveis de estabelecimentos
+      const links = await page.evaluate(() => {
         const results = [];
-        const seen = new Set(); // Remove duplicatas DENTRO da mesma página
+        const seen = new Set();
 
-        // Seletor específico para cards de estabelecimentos
-        const cards = document.querySelectorAll('div[jscontroller]');
+        // Pega todos os links principais dos estabelecimentos
+        const allLinks = document.querySelectorAll('a[href*="/maps/place/"]');
 
-        cards.forEach(card => {
-          const text = card.textContent || '';
+        allLinks.forEach(link => {
+          const href = link.href;
+          const nome = link.textContent?.trim();
 
-          // Busca nome - usa div[role="heading"] que é o mais confiável
-          const headings = card.querySelectorAll('div[role="heading"]');
-          let nome = '';
-          if (headings.length > 0) {
-            nome = headings[0].textContent.trim();
-          }
-
-          // Busca telefone com TODOS os padrões possíveis
-          const phonePatterns = [
-            /\(\d{2}\)\s?\d{4,5}[-\s]?\d{4}/g,       // (11) 98765-4321 ou (11) 98765 4321
-            /\d{2}\s?\d{4,5}[-\s]?\d{4}/g,           // 11 98765-4321 ou 11 98765 4321
-            /\+55\s?\(?\d{2}\)?\s?\d{4,5}[-\s]?\d{4}/g, // +55 (11) 98765-4321
-            /\(\d{2}\)\s?\d{8,9}/g,                   // (11) 987654321
-            /\d{10,11}/g                              // 11987654321
-          ];
-
-          let telefone = null;
-          for (const pattern of phonePatterns) {
-            const matches = text.match(pattern);
-            if (matches && matches.length > 0) {
-              // Pega o primeiro match válido
-              telefone = matches[0];
-              break;
-            }
-          }
-
-          // Valida se é realmente um estabelecimento
-          if (nome && telefone && nome.length > 3 && nome.length < 150) {
-            // Verifica se não é lixo (menus, botões, etc)
-            const temPalavrasInvalidas = /^(Ver mais|Pesquisar|Filtrar|Mapa|Lista|Anterior|Próxim)/i.test(nome);
-
-            if (!temPalavrasInvalidas) {
-              // Verifica duplicata na mesma página
-              const key = `${nome}|${telefone}`;
-              if (!seen.has(key)) {
-                seen.add(key);
-                results.push({
-                  nome: nome,
-                  telefone: telefone
-                });
-              }
+          if (href && nome && nome.length > 3 && nome.length < 150 && !seen.has(href)) {
+            // Filtra lixo
+            if (!/^(Ver mais|Pesquisar|Filtrar|Mapa|Lista|Anterior|Próxim|Direções|Salvar)/i.test(nome)) {
+              seen.add(href);
+              results.push({ nome, href });
             }
           }
         });
@@ -93,88 +57,115 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         return results;
       });
 
-      console.log(`Página ${currentPage + 1}: ${estabelecimentosDaPagina.length} estabelecimentos com telefone encontrados`);
+      console.log(`Página ${currentPageNum + 1}: ${links.length} estabelecimentos encontrados`);
 
-      // Controla páginas vazias seguidas
-      if (estabelecimentosDaPagina.length === 0) {
+      if (links.length === 0) {
         paginasVaziasSeguidas++;
-        console.log(`Nenhum resultado nesta página (${paginasVaziasSeguidas} vazias seguidas)`);
-
-        // Para se teve 5 páginas vazias seguidas
         if (paginasVaziasSeguidas >= 5) {
           console.log('Encerrando busca - 5 páginas vazias seguidas');
           break;
         }
       } else {
-        paginasVaziasSeguidas = 0; // Reseta contador
+        paginasVaziasSeguidas = 0;
 
-        // Adiciona apenas os NOVOS únicos ao Map
+        // Processa links em lotes pequenos para ser mais rápido
         let novosAdicionados = 0;
-        estabelecimentosDaPagina.forEach(est => {
-          const key = `${est.nome}|${est.telefone}`;
-          if (!uniqueEstabelecimentos.has(key)) {
-            uniqueEstabelecimentos.set(key, est);
-            novosAdicionados++;
+        for (let i = 0; i < links.length && uniqueEstabelecimentos.size < quantidade; i++) {
+          const { nome, href } = links[i];
+
+          // Verifica se já temos esse nome
+          if (Array.from(uniqueEstabelecimentos.values()).some(e => e.nome === nome)) {
+            continue;
           }
-        });
 
-        console.log(`   → Novos únicos adicionados: ${novosAdicionados} de ${estabelecimentosDaPagina.length}`);
-        console.log(`   → Total de únicos até agora: ${uniqueEstabelecimentos.size}`);
+          try {
+            // Abre em nova aba para não perder a listagem
+            const detailPage = await browser.newPage();
+            await detailPage.goto(href, { waitUntil: 'domcontentloaded', timeout: 10000 });
+            await new Promise(r => setTimeout(r, 500));
 
-        // Conta páginas sem novos
-        if (novosAdicionados === 0) {
-          paginasSemNovos++;
-          if (paginasSemNovos >= 3) {
-            console.log('Encerrando busca - 3 páginas seguidas sem novos únicos');
+            // Extrai telefone da página de detalhes
+            const telefone = await detailPage.evaluate(() => {
+              const phonePatterns = [
+                /\(\d{2}\)\s?\d{4,5}[-\s]?\d{4}/g,
+                /\d{2}\s?\d{4,5}[-\s]?\d{4}/g,
+                /\+55\s?\(?\d{2}\)?\s?\d{4,5}[-\s]?\d{4}/g,
+                /\(\d{2}\)\s?\d{8,9}/g,
+                /\d{10,11}/g
+              ];
+
+              const bodyText = document.body.textContent || '';
+
+              for (const pattern of phonePatterns) {
+                const matches = bodyText.match(pattern);
+                if (matches && matches.length > 0) {
+                  return matches[0];
+                }
+              }
+
+              return null;
+            });
+
+            await detailPage.close();
+
+            if (telefone) {
+              const key = `${nome}|${telefone}`;
+              if (!uniqueEstabelecimentos.has(key)) {
+                uniqueEstabelecimentos.set(key, { nome, telefone });
+                novosAdicionados++;
+                console.log(`   ✓ [${uniqueEstabelecimentos.size}] ${nome} - ${telefone}`);
+              }
+            }
+          } catch (err) {
+            console.log(`   ✗ Erro ao acessar ${nome}: ${err.message}`);
+          }
+
+          // Para se já temos o suficiente
+          if (uniqueEstabelecimentos.size >= quantidade) {
             break;
           }
-        } else {
-          paginasSemNovos = 0;
         }
+
+        console.log(`   → Novos únicos adicionados: ${novosAdicionados}`);
+        console.log(`   → Total de únicos até agora: ${uniqueEstabelecimentos.size}`);
       }
 
-      currentPage++;
+      currentPageNum++;
 
-      // Se já temos únicos suficientes, para
       if (uniqueEstabelecimentos.size >= quantidade) {
         console.log(`✓ Quantidade de únicos atingida: ${uniqueEstabelecimentos.size} >= ${quantidade}`);
         break;
       }
 
-      // Log de progresso baseado em únicos
       const percentComplete = Math.min(100, Math.floor((uniqueEstabelecimentos.size / quantidade) * 100));
       console.log(`Progresso: ${percentComplete}% (${uniqueEstabelecimentos.size}/${quantidade})`);
     }
 
-    // Converte Map para array
     const unique = Array.from(uniqueEstabelecimentos.values());
-
-    console.log(`Total coletado: ${unique.length} estabelecimentos únicos (${currentPage} páginas)`);
+    console.log(`Total coletado: ${unique.length} estabelecimentos únicos (${currentPageNum} páginas)`);
 
     if (unique.length === 0) {
       throw new Error('Nenhum resultado encontrado');
     }
 
-    // Avisa se encontrou menos do que o solicitado
     if (unique.length < quantidade) {
       onProgress({
-        status: `Encontrados apenas ${unique.length} contatos. Não há mais resultados disponíveis.`,
+        status: `Encontrados ${unique.length} contatos de ${quantidade} solicitados.`,
         percent: 35
       });
       console.log(`⚠️ Solicitado: ${quantidade}, Encontrado: ${unique.length}`);
-      await new Promise(r => setTimeout(r, 2000)); // Pausa para usuário ver a mensagem
+      await new Promise(r => setTimeout(r, 2000));
     }
 
-    onProgress({ status: 'Extraindo contatos...', percent: 40 });
+    onProgress({ status: 'Enviando contatos...', percent: 40 });
 
     const limit = Math.min(unique.length, quantidade);
 
-    // Envia os resultados em tempo real
     for (let i = 0; i < limit; i++) {
       const est = unique[i];
 
       onProgress({
-        status: `Extraindo ${i + 1}/${limit}...`,
+        status: `Enviando ${i + 1}/${limit}...`,
         percent: 40 + Math.floor((i / limit) * 55)
       });
 
@@ -185,10 +176,7 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         index: i + 1
       });
 
-      console.log(`✓ [${i + 1}] ${est.nome} - ${est.telefone}`);
-
-      // Pequeno delay para não sobrecarregar o socket
-      await new Promise(r => setTimeout(r, 50));
+      await new Promise(r => setTimeout(r, 30));
     }
 
     onProgress({ status: 'Concluído!', percent: 100 });
