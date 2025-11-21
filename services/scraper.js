@@ -19,7 +19,6 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
     const maxPages = 50;
     let paginasVaziasSeguidas = 0;
 
-    // Continua buscando até ter leads ÚNICOS suficientes
     while (uniqueEstabelecimentos.size < quantidade && currentPageNum < maxPages) {
       const start = currentPageNum * 10;
       const url = `https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q=${encodeURIComponent(query)}&start=${start}`;
@@ -30,23 +29,28 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         percent: 10 + Math.floor((currentPageNum / maxPages) * 20)
       });
 
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-      await new Promise(r => setTimeout(r, 1500));
+      await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
+      await new Promise(r => setTimeout(r, 2000));
 
-      // Extrai todos os links clicáveis de estabelecimentos
-      const links = await page.evaluate(() => {
+      // Extrai estabelecimentos da página atual
+      const estabelecimentosDaPagina = await page.evaluate(() => {
         const results = [];
         const seen = new Set();
 
-        // Busca por cards de estabelecimentos com nome
+        // Pega TODOS os divs com jscontroller
         const cards = document.querySelectorAll('div[jscontroller]');
 
         cards.forEach(card => {
+          const text = card.textContent || '';
+
           // Busca nome
           const headings = card.querySelectorAll('div[role="heading"]');
-          if (headings.length === 0) return;
+          let nome = '';
+          if (headings.length > 0) {
+            nome = headings[0].textContent.trim();
+          }
 
-          const nome = headings[0].textContent?.trim();
+          // Se não tem nome, pula
           if (!nome || nome.length < 3 || nome.length > 150) return;
 
           // Filtra lixo
@@ -54,25 +58,40 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
             return;
           }
 
-          // Busca link dentro do card
-          const link = card.querySelector('a[href]');
-          if (!link) return;
+          // Busca telefone com TODAS as variações
+          const phonePatterns = [
+            /\(\d{2}\)\s?\d{4,5}[-\s]?\d{4}/g,
+            /\d{2}\s?\d{4,5}[-\s]?\d{4}/g,
+            /\+55\s?\(?\d{2}\)?\s?\d{4,5}[-\s]?\d{4}/g,
+            /\(\d{2}\)\s?\d{8,9}/g,
+            /\d{10,11}/g
+          ];
 
-          const href = link.href;
+          let telefone = null;
+          for (const pattern of phonePatterns) {
+            const matches = text.match(pattern);
+            if (matches && matches.length > 0) {
+              telefone = matches[0];
+              break;
+            }
+          }
 
-          // Verifica se é um link válido do Maps
-          if (href && (href.includes('maps') || href.includes('place')) && !seen.has(nome)) {
-            seen.add(nome);
-            results.push({ nome, href });
+          // Só adiciona se tem telefone
+          if (telefone) {
+            const key = `${nome}|${telefone}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              results.push({ nome, telefone });
+            }
           }
         });
 
         return results;
       });
 
-      console.log(`Página ${currentPageNum + 1}: ${links.length} estabelecimentos encontrados`);
+      console.log(`Página ${currentPageNum + 1}: ${estabelecimentosDaPagina.length} estabelecimentos com telefone`);
 
-      if (links.length === 0) {
+      if (estabelecimentosDaPagina.length === 0) {
         paginasVaziasSeguidas++;
         if (paginasVaziasSeguidas >= 5) {
           console.log('Encerrando busca - 5 páginas vazias seguidas');
@@ -81,65 +100,17 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
       } else {
         paginasVaziasSeguidas = 0;
 
-        // Processa links em lotes pequenos para ser mais rápido
+        // Adiciona novos únicos
         let novosAdicionados = 0;
-        for (let i = 0; i < links.length && uniqueEstabelecimentos.size < quantidade; i++) {
-          const { nome, href } = links[i];
-
-          // Verifica se já temos esse nome
-          if (Array.from(uniqueEstabelecimentos.values()).some(e => e.nome === nome)) {
-            continue;
+        estabelecimentosDaPagina.forEach(est => {
+          const key = `${est.nome}|${est.telefone}`;
+          if (!uniqueEstabelecimentos.has(key)) {
+            uniqueEstabelecimentos.set(key, est);
+            novosAdicionados++;
           }
+        });
 
-          try {
-            // Abre em nova aba para não perder a listagem
-            const detailPage = await browser.newPage();
-            await detailPage.goto(href, { waitUntil: 'domcontentloaded', timeout: 10000 });
-            await new Promise(r => setTimeout(r, 500));
-
-            // Extrai telefone da página de detalhes
-            const telefone = await detailPage.evaluate(() => {
-              const phonePatterns = [
-                /\(\d{2}\)\s?\d{4,5}[-\s]?\d{4}/g,
-                /\d{2}\s?\d{4,5}[-\s]?\d{4}/g,
-                /\+55\s?\(?\d{2}\)?\s?\d{4,5}[-\s]?\d{4}/g,
-                /\(\d{2}\)\s?\d{8,9}/g,
-                /\d{10,11}/g
-              ];
-
-              const bodyText = document.body.textContent || '';
-
-              for (const pattern of phonePatterns) {
-                const matches = bodyText.match(pattern);
-                if (matches && matches.length > 0) {
-                  return matches[0];
-                }
-              }
-
-              return null;
-            });
-
-            await detailPage.close();
-
-            if (telefone) {
-              const key = `${nome}|${telefone}`;
-              if (!uniqueEstabelecimentos.has(key)) {
-                uniqueEstabelecimentos.set(key, { nome, telefone });
-                novosAdicionados++;
-                console.log(`   ✓ [${uniqueEstabelecimentos.size}] ${nome} - ${telefone}`);
-              }
-            }
-          } catch (err) {
-            console.log(`   ✗ Erro ao acessar ${nome}: ${err.message}`);
-          }
-
-          // Para se já temos o suficiente
-          if (uniqueEstabelecimentos.size >= quantidade) {
-            break;
-          }
-        }
-
-        console.log(`   → Novos únicos adicionados: ${novosAdicionados}`);
+        console.log(`   → Novos únicos adicionados: ${novosAdicionados} de ${estabelecimentosDaPagina.length}`);
         console.log(`   → Total de únicos até agora: ${uniqueEstabelecimentos.size}`);
       }
 
@@ -189,6 +160,7 @@ async function extractLeadsRealtime(nicho, regiao, quantidade, onNewLead, onProg
         index: i + 1
       });
 
+      console.log(`✓ [${i + 1}] ${est.nome} - ${est.telefone}`);
       await new Promise(r => setTimeout(r, 30));
     }
 
